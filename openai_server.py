@@ -155,6 +155,8 @@ class BatchedOpenAIServer:
             self._distributed_generate(payload)
 
     def _scheduler_loop(self):
+        torch.cuda.set_device(int(os.getenv("LOCAL_RANK", "0")))
+        torch.set_default_device("cuda")
         while not self.stopping:
             batch = self._dequeue_batch()
             if not batch:
