@@ -787,14 +787,13 @@ class Block(nn.Module):
             self.hc_attn_base = nn.Parameter(torch.empty(mix_hc))
             self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc))
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
-            self.hc_ffn_scale = nn.Parameter(torch.empty(1))
+            self.hc_ffn_scale = nn.Parameter(torch.empty(3))
 
     def reset_cache(self, release: bool = False):
         self.attn.reset_cache(release)
 
     def hc_pre(self, x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor):
         residual = x
-        post, comb = hc_split_sinkhorn(fn, scale, base, self.hc_sinkhorn_iters, self.hc_eps)
         # x: [b,s,hc,d], fn: [mix_hc,hc*d], scale: [3], base: [mix_hc], y: [b,s,hc,d]
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()

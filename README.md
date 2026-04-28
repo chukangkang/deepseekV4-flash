@@ -74,6 +74,127 @@ export NCCL_SOCKET_FAMILY=AF_INET # Force IPv4
 export NCCL_DEBUG=INFO             # Debug NCCL connectivity
 ```
 
+### OpenAI-compatible API service
+
+This repository also provides an OpenAI-compatible HTTP server via `openai_server.py`.
+
+Available endpoints:
+- `GET /health`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+Only global rank 0 serves HTTP traffic. Other ranks participate in distributed inference only.
+
+#### Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+#### Launch on 2 nodes x 8 GPUs
+
+**Node 0 (master):**
+```bash
+torchrun --nnodes 2 --nproc-per-node 8 --node-rank 0 --master-addr MASTER_IP --master-port 29500 openai_server.py --ckpt-path /path/to/pp2-tp8-checkpoint --config config.json --host 0.0.0.0 --port 8000 --model-name deepseek-v4-flash
+```
+
+**Node 1 (worker):**
+```bash
+torchrun --nnodes 2 --nproc-per-node 8 --node-rank 1 --master-addr MASTER_IP --master-port 29500 openai_server.py --ckpt-path /path/to/pp2-tp8-checkpoint --config config.json --host 0.0.0.0 --port 8000 --model-name deepseek-v4-flash
+```
+
+#### Launch on a single 16-GPU node
+```bash
+torchrun --nproc-per-node 16 openai_server.py --ckpt-path /path/to/pp2-tp8-checkpoint --config config.json --host 0.0.0.0 --port 8000 --model-name deepseek-v4-flash
+```
+
+#### Recommended flags for long-context experiments
+```bash
+torchrun --nnodes 2 --nproc-per-node 8 --node-rank 0 --master-addr MASTER_IP --master-port 29500 openai_server.py --ckpt-path /path/to/pp2-tp8-checkpoint --config config.json --host 0.0.0.0 --port 8000 --model-name deepseek-v4-flash --max-seq-len 131072 --max-batch-size 8 --max-batch-total-tokens 65536 --prefill-chunk-size 256 --release-kv-after-batch
+```
+
+Useful flags:
+- `--max-seq-len`: override runtime context length for long-context experiments
+- `--max-batch-size`: max requests per scheduling batch
+- `--max-batch-total-tokens`: token budget per sub-batch to avoid oversized mixed batches
+- `--prefill-chunk-size`: chunk size used during prompt prefill
+- `--release-kv-after-batch`: release KV storage after each batch for a safer memory profile
+
+#### Test the API
+
+Windows PowerShell:
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"deepseek-v4-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"你好，介绍一下你自己\"}],\"max_tokens\":128,\"temperature\":0.6}"
+```
+
+Linux/macOS:
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"你好，介绍一下你自己"}],"max_tokens":128,"temperature":0.6}'
+```
+
+For OpenAI-compatible clients, use:
+- Base URL: `http://HOST:8000/v1`
+- Model: `deepseek-v4-flash`
+
+#### Request example
+
+Minimal JSON payload for `POST /v1/chat/completions`:
+
+```json
+{
+  "model": "deepseek-v4-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Write a short introduction about DeepSeek-V4-Flash."
+    }
+  ],
+  "max_tokens": 128,
+  "temperature": 0.6,
+  "top_p": 0.95
+}
+```
+
+Common request fields:
+- `model`: must match the name passed by `--model-name`
+- `messages`: OpenAI-format chat messages
+- `max_tokens`: maximum generated tokens
+- `temperature`: set to `0` for greedy decoding
+- `top_p`: nucleus sampling threshold
+- `stop`: optional stop string or string list
+
+#### Long-context tuning suggestions
+
+Suggested rollout order:
+- `32k`
+- `64k`
+- `128k`
+- `256k`
+- `512k`
+- `1M`
+
+Practical tuning hints:
+- Start with `--release-kv-after-batch` enabled for stability during early tests.
+- Keep `--prefill-chunk-size` conservative, usually `256` or `512`.
+- Set `--max-batch-total-tokens` to avoid one large request monopolizing a batch.
+- Increase `--max-seq-len` gradually and watch both GPU memory and inter-node communication time.
+
+#### Troubleshooting
+
+- If only one node returns immediately and the other appears stuck, first verify `MASTER_IP`, `--master-port`, and NCCL network interface settings.
+- If the service starts but no HTTP port is exposed, confirm you are checking the machine hosting global rank 0.
+- If you hit context length errors, increase `--max-seq-len` explicitly at startup.
+- If mixed long and short prompts cause unstable latency, lower `--max-batch-size` or set `--max-batch-total-tokens`.
+- If memory grows too aggressively during long-context tests, enable `--release-kv-after-batch` and reduce batch token budget.
+
+#### Notes
+- Current distributed path is designed for `PP=2 x TP=8`, which expects 16 GPUs total.
+- For long-context rollout, increase gradually: `32k -> 64k -> 128k -> 256k -> 512k -> 1M`.
+- The current implementation already reduces decode communication by sampling on stage 1 and only returning the next token.
+
 ---
 
 ## (Legacy) TP=16 on 2 Nodes — Not Recommended
