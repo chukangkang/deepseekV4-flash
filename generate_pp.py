@@ -127,7 +127,7 @@ def generate(
     for i, t in enumerate(prompt_tokens):
         tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
     prev_pos = 0
-    finished = torch.tensor([False] * len(prompt_tokens))
+    finished = torch.zeros(len(prompt_tokens), dtype=torch.bool, device="cuda")
     prompt_mask = tokens != -1
     for cur_pos in range(min(prompt_lens), total_len):
         input_ids = tokens[:, prev_pos:cur_pos]
@@ -138,7 +138,7 @@ def generate(
             next_token = logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
-        finished |= torch.logical_and(~prompt_mask[:, cur_pos].cpu(), next_token.cpu() == eos_id)
+        finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
         prev_pos = cur_pos
         if finished.all():
             break
