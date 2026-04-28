@@ -12,6 +12,7 @@ import os
 import json
 import sys
 from argparse import ArgumentParser
+from datetime import timedelta
 from typing import List
 
 import torch
@@ -166,7 +167,7 @@ def main(
 
     assert global_world_size == 16, f"PP=2 x TP=8 requires exactly 16 GPUs, got {global_world_size}"
 
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", timeout=timedelta(hours=12))
 
     # Pipeline parallelism config
     pp_size = 2
@@ -185,6 +186,7 @@ def main(
     tp_group_0 = dist.new_group(stage0_ranks)
     tp_group_1 = dist.new_group(stage1_ranks)
     tp_grp = tp_group_0 if pp_rank == 0 else tp_group_1
+    ctrl_group = dist.new_group(backend="gloo", timeout=timedelta(hours=12))
 
     global print
     if global_rank != 0:
@@ -230,10 +232,10 @@ def main(
             if global_rank == 0:
                 prompt = input(">>> ")
                 objects = [prompt]
-                dist.broadcast_object_list(objects, 0)
+                dist.broadcast_object_list(objects, 0, group=ctrl_group)
             else:
                 objects = [None]
-                dist.broadcast_object_list(objects, 0)
+                dist.broadcast_object_list(objects, 0, group=ctrl_group)
                 prompt = objects[0]
             if prompt == "/exit":
                 break
