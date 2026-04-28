@@ -66,7 +66,7 @@ def load_pp_weights(model: Transformer, shard_file: str, pp_rank: int, pp_size: 
     
     remapped = {}
     skipped = 0
-    with safe_open(shard_file, framework="pt", device="cuda") as f:
+    with safe_open(shard_file, framework="pt", device="cpu") as f:
         for ckpt_key in f.keys():
             model_key = _remap_key(ckpt_key, layer_start, layer_end, pp_rank, pp_size)
             if model_key is None:
