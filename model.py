@@ -81,6 +81,75 @@ class ModelArgs:
     hc_eps: float = 1e-6
 
 
+class DynamicKVCache:
+    def __init__(self, max_batch_size: int, head_dim: int, min_capacity: int = 1, growth_factor: int = 2, block_len: int = 256):
+        self.max_batch_size = max_batch_size
+        self.head_dim = head_dim
+        self.min_capacity = max(1, min_capacity)
+        self.growth_factor = max(2, growth_factor)
+        self.block_len = max(1, block_len)
+        self.storage: Optional[torch.Tensor] = None
+        self.flat_storage: Optional[torch.Tensor] = None
+        self.capacity = 0
+        self.num_blocks = 0
+
+    def _round_capacity(self, length: int) -> int:
+        return ((max(1, length) + self.block_len - 1) // self.block_len) * self.block_len
+
+    def _blocks_for(self, length: int) -> int:
+        return max(1, (max(1, length) + self.block_len - 1) // self.block_len)
+
+    def _next_capacity(self, required_len: int) -> int:
+        capacity = self._round_capacity(max(self.min_capacity, self.capacity, self.block_len))
+        while capacity < required_len:
+            capacity = self._round_capacity(max(capacity * self.growth_factor, required_len))
+        return capacity
+
+    def logical_block_table(self, required_len: int) -> torch.Tensor:
+        needed_blocks = self._blocks_for(required_len)
+        return torch.arange(needed_blocks, dtype=torch.int32, device=self.storage.device if self.storage is not None else None)
+
+    def logical_view(self, length: Optional[int] = None) -> Optional[torch.Tensor]:
+        if self.flat_storage is None:
+            return None
+        if length is None:
+            return self.flat_storage
+        return self.flat_storage[:, :length]
+
+    def ensure(self, batch_size: int, required_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        batch_capacity = max(self.max_batch_size, batch_size)
+        required_len = max(1, required_len)
+        should_realloc = (
+            self.storage is None or
+            self.storage.device != device or
+            self.storage.dtype != dtype or
+            self.storage.size(0) < batch_capacity or
+            self.capacity < required_len
+        )
+        if not should_realloc:
+            return self.flat_storage
+        new_capacity = self._next_capacity(required_len)
+        new_num_blocks = self._blocks_for(new_capacity)
+        new_storage = torch.zeros(batch_capacity, new_num_blocks, self.block_len, self.head_dim, dtype=dtype, device=device)
+        new_flat_storage = new_storage.view(batch_capacity, new_num_blocks * self.block_len, self.head_dim)
+        if self.flat_storage is not None and self.storage is not None and self.storage.device == device and self.storage.dtype == dtype:
+            copy_batch = min(self.flat_storage.size(0), new_flat_storage.size(0))
+            copy_len = min(self.flat_storage.size(1), new_flat_storage.size(1))
+            new_flat_storage[:copy_batch, :copy_len].copy_(self.flat_storage[:copy_batch, :copy_len])
+        self.storage = new_storage
+        self.flat_storage = new_flat_storage
+        self.capacity = new_capacity
+        self.num_blocks = new_num_blocks
+        return self.flat_storage
+
+    def reset(self, release: bool = False):
+        if release:
+            self.storage = None
+            self.flat_storage = None
+            self.capacity = 0
+            self.num_blocks = 0
+
+
 class ParallelEmbedding(nn.Module):
     """Embedding sharded along the vocab dimension. Each rank holds vocab_size // world_size rows.
     Out-of-range indices are zero-masked before all_reduce to combine partial embeddings."""
@@ -230,6 +299,13 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     return freqs_cis
 
 
+@lru_cache(maxsize=32)
+def get_freqs_cis_cached(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow, device_type: str, device_index: int) -> torch.Tensor:
+    freqs_cis = precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast, beta_slow)
+    device = torch.device(device_type, device_index) if device_index >= 0 else torch.device(device_type)
+    return freqs_cis.to(device=device)
+
+
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """Applies rotary positional embeddings in-place. Uses conjugate for inverse (de-rotation)."""
     y = x
@@ -304,6 +380,12 @@ class Compressor(nn.Module):
         self.register_buffer("kv_state", torch.zeros(args.max_batch_size, coff * compress_ratio, coff * self.head_dim, dtype=torch.float32), persistent=False)
         self.register_buffer("score_state", torch.full((args.max_batch_size, coff * compress_ratio, coff * self.head_dim), float("-inf"), dtype=torch.float32), persistent=False)
         self.freqs_cis: torch.Tensor = None
+
+    def reset_cache(self):
+        self.kv_cache = None
+        self.freqs_cis = None
+        self.kv_state.zero_()
+        self.score_state.fill_(float("-inf"))
 
     def overlap_transform(self, tensor: torch.Tensor, value=0):
         # tensor: [b,s,r,2d]
@@ -397,8 +479,15 @@ class Indexer(torch.nn.Module):
         self.compress_ratio = compress_ratio
 
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
-        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim), persistent=False)
+        self.kv_cache_mgr = DynamicKVCache(args.max_batch_size, self.head_dim, min_capacity=max(1, args.window_size // compress_ratio if compress_ratio else 1))
+        self.kv_cache: Optional[torch.Tensor] = None
         self.freqs_cis = None
+
+    def reset_cache(self, release: bool = False):
+        self.kv_cache_mgr.reset(release)
+        self.kv_cache = None
+        self.freqs_cis = None
+        self.compressor.reset_cache()
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
         bsz, seqlen, _ = x.size()
@@ -406,9 +495,10 @@ class Indexer(torch.nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
-        if self.compressor.kv_cache is None:
-            self.compressor.kv_cache = self.kv_cache
-            self.compressor.freqs_cis = self.freqs_cis
+        required_len = max(1, (end_pos + ratio - 1) // ratio)
+        self.kv_cache = self.kv_cache_mgr.ensure(bsz, required_len, x.device, x.dtype)
+        self.compressor.kv_cache = self.kv_cache
+        self.compressor.freqs_cis = self.freqs_cis
         q = self.wq_b(qr)
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
@@ -471,24 +561,52 @@ class Attention(nn.Module):
             else:
                 self.indexer = None
 
-        kv_cache_size = args.window_size + (args.max_seq_len // self.compress_ratio if self.compress_ratio else 0)
-        self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, kv_cache_size, self.head_dim), persistent=False)
+        self.kv_cache_mgr = DynamicKVCache(args.max_batch_size, self.head_dim, min_capacity=max(args.window_size, 1 + args.window_size))
+        self.kv_cache: Optional[torch.Tensor] = None
         if self.compress_ratio:
             original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta
         else:
             # disable YaRN and use base rope_theta in pure sliding-window attention
             original_seq_len, rope_theta = 0, args.rope_theta
-        freqs_cis = precompute_freqs_cis(self.rope_head_dim, args.max_seq_len, original_seq_len,
-                                         rope_theta, args.rope_factor, args.beta_fast, args.beta_slow)
-        self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        self.original_seq_len = original_seq_len
+        self.rope_theta = rope_theta
+        self.rope_factor = args.rope_factor
+        self.beta_fast = args.beta_fast
+        self.beta_slow = args.beta_slow
+        self.max_seq_len = args.max_seq_len
+        self.freqs_cis: Optional[torch.Tensor] = None
+
+    def reset_cache(self, release: bool = False):
+        self.kv_cache_mgr.reset(release)
+        self.kv_cache = None
+        self.freqs_cis = None
+        if self.compress_ratio:
+            self.compressor.reset_cache()
+            if self.indexer is not None:
+                self.indexer.reset_cache(release)
 
     def forward(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
+        device = x.device
+        device_index = device.index if device.index is not None else -1
+        self.freqs_cis = get_freqs_cis_cached(
+            self.rope_head_dim,
+            self.max_seq_len,
+            self.original_seq_len,
+            self.rope_theta,
+            self.rope_factor,
+            self.beta_fast,
+            self.beta_slow,
+            device.type,
+            device_index,
+        )
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
-        if self.compress_ratio and self.compressor.kv_cache is None:
+        compressed_required = 0 if not ratio else max(1, (start_pos // ratio) + 1 if start_pos > 0 else seqlen // ratio)
+        self.kv_cache = self.kv_cache_mgr.ensure(bsz, win + compressed_required, device, x.dtype)
+        if self.compress_ratio:
             self.compressor.kv_cache = self.kv_cache[:, win:]
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
@@ -669,15 +787,20 @@ class Block(nn.Module):
             self.hc_attn_base = nn.Parameter(torch.empty(mix_hc))
             self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc))
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
-            self.hc_ffn_scale = nn.Parameter(torch.empty(3))
+            self.hc_ffn_scale = nn.Parameter(torch.empty(1))
 
-    def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
-        # x: [b,s,hc,d], hc_fn: [mix_hc,hc*d], hc_scale: [3], hc_base: [mix_hc], y: [b,s,hc,d]
+    def reset_cache(self, release: bool = False):
+        self.attn.reset_cache(release)
+
+    def hc_pre(self, x: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor):
+        residual = x
+        post, comb = hc_split_sinkhorn(fn, scale, base, self.hc_sinkhorn_iters, self.hc_eps)
+        # x: [b,s,hc,d], fn: [mix_hc,hc*d], scale: [3], base: [mix_hc], y: [b,s,hc,d]
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
-        pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
+        mixes = F.linear(x, fn) * rsqrt
+        pre, post, comb = hc_split_sinkhorn(mixes, scale, base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype), post, comb
 
@@ -841,6 +964,12 @@ class Transformer(nn.Module):
                 self.hc_head_fn = None
                 self.hc_head_base = None
                 self.hc_head_scale = None
+
+    def reset_caches(self, release: bool = False):
+        for layer in self.layers:
+            layer.reset_cache(release)
+        for layer in self.mtp:
+            layer.reset_cache(release)
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0, hidden_states: torch.Tensor = None):

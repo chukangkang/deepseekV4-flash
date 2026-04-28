@@ -13,7 +13,7 @@ import json
 import sys
 from argparse import ArgumentParser
 from datetime import timedelta
-from typing import List
+from typing import List, Sequence
 
 import torch
 import torch.distributed as dist
@@ -87,6 +87,34 @@ def sample(logits, temperature: float = 1.0):
     return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
 
 
+def sample_with_top_p(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 1.0, seed: int = 0):
+    if temperature <= 0:
+        return logits.argmax(dim=-1)
+    logits = logits / max(temperature, 1e-5)
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    generator = torch.Generator(device=logits.device)
+    generator.manual_seed(seed)
+    if top_p < 1.0:
+        sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+        cumulative = sorted_probs.cumsum(dim=-1)
+        keep = cumulative <= top_p
+        keep[..., 0] = True
+        sorted_probs = torch.where(keep, sorted_probs, torch.zeros_like(sorted_probs))
+        sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp_min_(1e-12)
+        noise = torch.rand(sorted_probs.shape, generator=generator, device=sorted_probs.device).clamp_(1e-12, 1.0)
+        sampled = sorted_probs.div_(-noise.log_()).argmax(dim=-1)
+        return sorted_indices.gather(1, sampled.unsqueeze(-1)).squeeze(-1)
+    noise = torch.rand(probs.shape, generator=generator, device=probs.device).clamp_(1e-12, 1.0)
+    return probs.div_(-noise.log_()).argmax(dim=-1)
+
+
+def sample_batch(logits: torch.Tensor, temperatures: Sequence[float], top_ps: Sequence[float], seed: int):
+    next_token = torch.empty(logits.size(0), dtype=torch.long, device=logits.device)
+    for row in range(logits.size(0)):
+        next_token[row] = sample_with_top_p(logits[row:row + 1], temperatures[row], top_ps[row], seed + row)
+    return next_token
+
+
 def pp_forward(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size):
     """One forward step with pipeline parallelism.
     Stage 0: embed + layers → send hidden [bsz, seqlen, hc_mult, dim] (bf16) to stage 1
@@ -107,6 +135,23 @@ def pp_forward(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim,
         return logits
 
 
+def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
+                  temperatures, top_ps, seed: int):
+    bsz, seqlen = input_ids.size()
+    if pp_rank == 0:
+        h = model.forward(input_ids, start_pos)
+        dist.send(h.contiguous(), dst=pp_peer_rank)
+        next_token = torch.empty(bsz, dtype=torch.long, device="cuda")
+        dist.recv(next_token, src=pp_peer_rank)
+        return next_token
+    h = torch.empty(bsz, seqlen, hc_mult, dim, dtype=torch.bfloat16, device="cuda")
+    dist.recv(h, src=pp_peer_rank)
+    logits = model.forward(input_ids, start_pos, hidden_states=h)
+    next_token = sample_batch(logits, temperatures, top_ps, seed)
+    dist.send(next_token.contiguous(), dst=pp_peer_rank)
+    return next_token
+
+
 @torch.inference_mode()
 def generate(
     model: Transformer,
@@ -119,6 +164,7 @@ def generate(
     dim: int,
     vocab_size: int,
     temperature: float = 1.0,
+    top_p: float = 1.0,
 ) -> List[List[int]]:
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len
@@ -131,11 +177,19 @@ def generate(
     prompt_mask = tokens != -1
     for cur_pos in range(min(prompt_lens), total_len):
         input_ids = tokens[:, prev_pos:cur_pos]
-        logits = pp_forward(model, input_ids, prev_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size)
-        if temperature > 0:
-            next_token = sample(logits, temperature)
-        else:
-            next_token = logits.argmax(dim=-1)
+        next_token = pp_next_token(
+            model,
+            input_ids,
+            prev_pos,
+            pp_rank,
+            pp_peer_rank,
+            hc_mult,
+            dim,
+            vocab_size,
+            [temperature] * len(prompt_tokens),
+            [top_p] * len(prompt_tokens),
+            33377335 + cur_pos,
+        )
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
@@ -159,6 +213,7 @@ def main(
     interactive: bool = True,
     max_new_tokens: int = 100,
     temperature: float = 1.0,
+    top_p: float = 1.0,
 ) -> None:
     # Global distributed setup
     global_world_size = int(os.getenv("WORLD_SIZE", "1"))
@@ -247,7 +302,7 @@ def main(
             completion_tokens = generate(model, [prompt_tokens], max_new_tokens,
                                         tokenizer.eos_token_id,
                                         pp_rank, pp_peer_rank, hc_mult,
-                                        dim, vocab_size, temperature)
+                                        dim, vocab_size, temperature, top_p)
             completion = tokenizer.decode(completion_tokens[0])
             print(completion)
             messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
@@ -258,7 +313,7 @@ def main(
         completion_tokens = generate(model, prompt_tokens, max_new_tokens,
                                     tokenizer.eos_token_id,
                                     pp_rank, pp_peer_rank, hc_mult,
-                                    dim, vocab_size, temperature)
+                                    dim, vocab_size, temperature, top_p)
         completions = tokenizer.batch_decode(completion_tokens)
         for prompt, completion in zip(prompts, completions):
             print("Prompt:", prompt)
@@ -276,6 +331,7 @@ if __name__ == "__main__":
     parser.add_argument("--interactive", action="store_true")
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top-p", type=float, default=1.0)
     args = parser.parse_args()
     assert args.input_file or args.interactive
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature)
+    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature, args.top_p)
