@@ -524,7 +524,9 @@ class BatchedOpenAIServer:
             # Decode loop — optimized for the common bsz==1 pure-decode case
             _pure_decode = (bsz == 1 and shared_prefill == max_prompt_len)
             _gen_end_val = generation_ends[0].item() if _pure_decode else 0
+            _step_times = []
             for cur_pos in range(shared_prefill, total_len):
+                _t0 = time.perf_counter()
                 input_ids = tokens[:, prev_pos:cur_pos]
                 next_token = pp_next_token(
                     self.model,
@@ -541,6 +543,7 @@ class BatchedOpenAIServer:
                     h_buf=_pp_h_buf,
                     tok_buf=_pp_tok_buf,
                 )
+                _step_times.append(time.perf_counter() - _t0)
                 if _pure_decode:
                     # Fast path: bsz=1, all positions are decode — skip prompt_mask checks
                     tokens[0, cur_pos] = next_token[0]
@@ -612,6 +615,16 @@ class BatchedOpenAIServer:
                                     _log(f"V2 early break at pos {cur_pos}: {n_done}/{bsz} done, pending requests waiting")
                                 break
                 prev_pos = cur_pos
+            # Log step timing diagnostics
+            if _step_times and self.global_rank == 0:
+                n = len(_step_times)
+                first = _step_times[0] * 1000
+                if n > 1:
+                    decode_times = _step_times[1:]
+                    avg = sum(decode_times) / len(decode_times) * 1000
+                    _log(f"step timing: first={first:.0f}ms (prefill+decode), decode avg={avg:.1f}ms/tok ({1000/avg:.1f} tok/s), steps={n}")
+                else:
+                    _log(f"step timing: first={first:.0f}ms, steps={n}")
             # Build outputs + continuation info for unfinished items
             early_break = not finished.all()
             outputs: List[Dict[str, Any]] = []
@@ -789,6 +802,23 @@ def create_app(engine: BatchedOpenAIServer) -> FastAPI:
     return app
 
 
+@torch.inference_mode()
+def _warmup_pp(model, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size):
+    """Pre-create NCCL P2P communicators so the first real request doesn't pay the lazy-init cost.
+    Called by ALL ranks from init_runtime (before the worker/scheduler split)."""
+    _log("warming up PP communicators...")
+    dummy_ids = torch.zeros(1, 1, dtype=torch.long, device="cuda")
+    # Run two dummy forward+PP rounds to trigger both send→recv and recv→send communicator creation
+    for _ in range(2):
+        pp_next_token(
+            model, dummy_ids, 0, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
+            [0.0], [1.0], 0,
+        )
+    model.reset_caches(release=True)
+    torch.cuda.synchronize()
+    _log("PP warmup done")
+
+
 def init_runtime(ckpt_path: str, config_path: str, max_batch_size: int, max_seq_len_override: int):
     global_world_size = int(os.getenv("WORLD_SIZE", "1"))
     global_rank = int(os.getenv("RANK", "0"))
@@ -825,6 +855,7 @@ def init_runtime(ckpt_path: str, config_path: str, max_batch_size: int, max_seq_
     shard_file = os.path.join(ckpt_path, f"model{tp_rank}-mp{TP_SIZE}.safetensors")
     load_pp_weights(model, shard_file, pp_rank, pp_size)
     torch.set_default_device("cuda")
+    _warmup_pp(model, pp_rank, pp_peer_rank, args.hc_mult, args.dim, args.vocab_size)
     return model, tokenizer, args, ctrl_group, global_rank, pp_rank, pp_peer_rank
 
 
