@@ -1,12 +1,13 @@
 import asyncio
 import json
 import os
+import queue
 import sys
 import threading
 import time
 import uuid
 from argparse import ArgumentParser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Union
 
@@ -42,10 +43,14 @@ class ChatCompletionRequest(BaseModel):
 
 
 class RequestHandle:
-    def __init__(self):
+    def __init__(self, streaming: bool = False):
         self.event = threading.Event()
         self.result = None
         self.error = None
+        self.streaming = streaming
+        # For true streaming: scheduler pushes (type, data) tuples
+        # Types: ("token", str), ("finish", {finish_reason, usage}), ("error", Exception)
+        self.token_queue: Optional[queue.Queue] = queue.Queue() if streaming else None
 
     def set_result(self, result: Dict[str, Any]):
         self.result = result
@@ -54,6 +59,16 @@ class RequestHandle:
     def set_error(self, error: Exception):
         self.error = error
         self.event.set()
+        if self.token_queue is not None:
+            self.token_queue.put(("error", error))
+
+    def push_token(self, text: str):
+        if self.token_queue is not None and text:
+            self.token_queue.put(("token", text))
+
+    def push_finish(self, finish_reason: str, usage: Dict[str, Any]):
+        if self.token_queue is not None:
+            self.token_queue.put(("finish", {"finish_reason": finish_reason, "usage": usage}))
 
 
 @dataclass
@@ -74,6 +89,19 @@ class PreparedRequest:
     top_p: float
     max_new_tokens: int
     stop: Optional[Union[str, List[str]]]
+
+
+@dataclass
+class StreamContext:
+    """Tracks per-request incremental decoding state for true streaming."""
+    handle: RequestHandle
+    request_id: str
+    created: int
+    stop: Optional[Union[str, List[str]]]
+    prompt_len: int
+    gen_tokens: List[int] = field(default_factory=list)
+    prev_text: str = ""
+    finished: bool = False
 
 
 class BatchedOpenAIServer:
@@ -130,12 +158,14 @@ class BatchedOpenAIServer:
         if self.scheduler_thread is not None:
             self.scheduler_thread.join(timeout=5)
 
-    def submit(self, body: ChatCompletionRequest) -> RequestHandle:
-        handle = RequestHandle()
+    def submit(self, body: ChatCompletionRequest,
+               request_id: Optional[str] = None,
+               created: Optional[int] = None) -> RequestHandle:
+        handle = RequestHandle(streaming=body.stream)
         pending = PendingRequest(
-            request_id=f"chatcmpl-{uuid.uuid4().hex}",
+            request_id=request_id or f"chatcmpl-{uuid.uuid4().hex}",
             body=body,
-            created=int(time.time()),
+            created=created or int(time.time()),
             handle=handle,
         )
         with self.cv:
@@ -253,6 +283,18 @@ class BatchedOpenAIServer:
         if not prepared:
             return
         for subbatch in self._split_prepared_batches(prepared):
+            stream_ctxs: List[Optional[StreamContext]] = []
+            for item in subbatch:
+                if item.pending.handle.streaming:
+                    stream_ctxs.append(StreamContext(
+                        handle=item.pending.handle,
+                        request_id=item.pending.request_id,
+                        created=item.pending.created,
+                        stop=item.stop,
+                        prompt_len=len(item.prompt_tokens),
+                    ))
+                else:
+                    stream_ctxs.append(None)
             payload = {
                 "type": "generate",
                 "prompt_tokens": [item.prompt_tokens for item in subbatch],
@@ -261,9 +303,12 @@ class BatchedOpenAIServer:
                 "max_new_tokens": [item.max_new_tokens for item in subbatch],
             }
             try:
-                outputs = self._broadcast_and_generate(payload)
-                for item, output in zip(subbatch, outputs):
-                    item.pending.handle.set_result(self._build_response(item, output))
+                outputs = self._broadcast_and_generate(payload, stream_ctxs)
+                for item, output, sctx in zip(subbatch, outputs, stream_ctxs):
+                    if sctx is not None:
+                        self._finalize_stream(item, output, sctx)
+                    else:
+                        item.pending.handle.set_result(self._build_response(item, output))
             except Exception as exc:
                 for item in subbatch:
                     item.pending.handle.set_error(exc)
@@ -289,10 +334,11 @@ class BatchedOpenAIServer:
             batches.append(current)
         return batches
 
-    def _broadcast_and_generate(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _broadcast_and_generate(self, payload: Dict[str, Any],
+                                 stream_ctxs: Optional[List[Optional[StreamContext]]] = None) -> List[Dict[str, Any]]:
         payloads = [payload]
         dist.broadcast_object_list(payloads, src=0, group=self.ctrl_group)
-        return self._distributed_generate(payload)
+        return self._distributed_generate(payload, stream_ctxs)
 
     def _sample_one(self, logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
         if temperature <= 0:
@@ -312,7 +358,8 @@ class BatchedOpenAIServer:
         return sorted_indices.gather(1, sampled.unsqueeze(-1)).squeeze(-1)
 
     @torch.inference_mode()
-    def _distributed_generate(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _distributed_generate(self, payload: Dict[str, Any],
+                               stream_ctxs: Optional[List[Optional[StreamContext]]] = None) -> List[Dict[str, Any]]:
         self.model.reset_caches(release=False)
         prompt_tokens: List[List[int]] = payload["prompt_tokens"]
         temperatures: List[float] = payload["temperatures"]
@@ -367,6 +414,25 @@ class BatchedOpenAIServer:
                 tokens[:, cur_pos] = next_token
                 finished |= ((~prompt_mask[:, cur_pos]) & (next_token == self.tokenizer.eos_token_id)) | (cur_pos + 1 >= generation_ends)
                 prev_pos = cur_pos
+                # Push incremental tokens to streaming handles
+                if stream_ctxs is not None:
+                    next_token_list = next_token.tolist()
+                    for i, sctx in enumerate(stream_ctxs):
+                        if sctx is None or sctx.finished:
+                            continue
+                        is_prompt = prompt_mask[i, cur_pos].item()
+                        if is_prompt:
+                            continue
+                        tok_id = next_token_list[i]
+                        if tok_id == self.tokenizer.eos_token_id:
+                            sctx.finished = True
+                            continue
+                        sctx.gen_tokens.append(tok_id)
+                        new_text = self.tokenizer.decode(sctx.gen_tokens, skip_special_tokens=True)
+                        delta = new_text[len(sctx.prev_text):]
+                        if delta:
+                            sctx.handle.push_token(delta)
+                            sctx.prev_text = new_text
                 if finished.all():
                     break
             outputs: List[Dict[str, Any]] = []
@@ -395,6 +461,16 @@ class BatchedOpenAIServer:
         if cut is None:
             return text
         return text[:cut]
+
+    def _finalize_stream(self, prepared: PreparedRequest, output: Dict[str, Any], sctx: StreamContext):
+        """Send the finish signal to a streaming handle after generation completes."""
+        completion_token_count = len(sctx.gen_tokens)
+        usage = {
+            "prompt_tokens": output["prompt_tokens"],
+            "completion_tokens": completion_token_count,
+            "total_tokens": output["prompt_tokens"] + completion_token_count,
+        }
+        sctx.handle.push_finish("stop", usage)
 
     def _build_response(self, prepared: PreparedRequest, output: Dict[str, Any]) -> Dict[str, Any]:
         raw_text = self.tokenizer.decode(output["completion_tokens"], skip_special_tokens=False)
@@ -432,48 +508,49 @@ class BatchedOpenAIServer:
         }
 
 
-def build_stream_response(result: Dict[str, Any]):
+def build_true_stream_response(handle: RequestHandle, request_id: str, created: int, model_name: str):
+    """True token-by-token SSE streaming that reads from the handle's token_queue."""
     async def gen():
-        choice = result["choices"][0]
-        message = choice["message"]
+        # First chunk: role
         head = {
-            "id": result["id"],
+            "id": request_id,
             "object": "chat.completion.chunk",
-            "created": result["created"],
-            "model": result["model"],
+            "created": created,
+            "model": model_name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
         yield f"data: {json.dumps(head, ensure_ascii=False)}\n\n"
-        if message.get("tool_calls"):
-            chunk = {
-                "id": result["id"],
-                "object": "chat.completion.chunk",
-                "created": result["created"],
-                "model": result["model"],
-                "choices": [{"index": 0, "delta": {"tool_calls": message["tool_calls"]}, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        else:
-            content = message.get("content") or ""
-            step = 32
-            for start in range(0, len(content), step):
+        # Read tokens from queue until finish or error
+        while True:
+            try:
+                msg = await asyncio.to_thread(handle.token_queue.get, timeout=120)
+            except Exception:
+                break
+            msg_type = msg[0]
+            if msg_type == "token":
+                text = msg[1]
                 chunk = {
-                    "id": result["id"],
+                    "id": request_id,
                     "object": "chat.completion.chunk",
-                    "created": result["created"],
-                    "model": result["model"],
-                    "choices": [{"index": 0, "delta": {"content": content[start:start + step]}, "finish_reason": None}],
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                await asyncio.sleep(0)
-        tail = {
-            "id": result["id"],
-            "object": "chat.completion.chunk",
-            "created": result["created"],
-            "model": result["model"],
-            "choices": [{"index": 0, "delta": {}, "finish_reason": choice["finish_reason"]}],
-        }
-        yield f"data: {json.dumps(tail, ensure_ascii=False)}\n\n"
+            elif msg_type == "finish":
+                info = msg[1]
+                tail = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": info["finish_reason"]}],
+                    "usage": info.get("usage"),
+                }
+                yield f"data: {json.dumps(tail, ensure_ascii=False)}\n\n"
+                break
+            elif msg_type == "error":
+                break
         yield "data: [DONE]\n\n"
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -502,12 +579,16 @@ def create_app(engine: BatchedOpenAIServer) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest):
-        handle = engine.submit(body)
+        request_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created = int(time.time())
+        handle = engine.submit(body, request_id=request_id, created=created)
+        if body.stream:
+            # True streaming: return SSE response immediately; tokens are pushed
+            # by the scheduler thread as they are generated.
+            return build_true_stream_response(handle, request_id, created, engine.model_name)
         await asyncio.to_thread(handle.event.wait)
         if handle.error is not None:
             raise HTTPException(status_code=400, detail=str(handle.error))
-        if body.stream:
-            return build_stream_response(handle.result)
         return JSONResponse(handle.result)
 
     return app
