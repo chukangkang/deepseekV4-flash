@@ -5,3 +5,5 @@ fast_hadamard_transform
 tilelang==0.1.8
 fastapi>=0.115.0
 uvicorn>=0.32.0
+uvloop>=0.21.0
+httptools>=0.6.0

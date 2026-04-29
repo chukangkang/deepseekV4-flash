@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import json
 import os
 import queue
@@ -13,6 +14,20 @@ from typing import Any, Dict, List, Optional, Union
 
 def _log(msg):
     print(f"[openai_server] {msg}", flush=True)
+
+def _has_uvloop():
+    try:
+        import uvloop  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+def _has_httptools():
+    try:
+        import httptools  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 import torch
 import torch.distributed as dist
@@ -205,16 +220,31 @@ class BatchedOpenAIServer:
                 self.cv.wait(timeout=0.1)
             if self.stopping:
                 return []
-            batch = [self.pending.pop(0)]
+            # Drain all currently available requests
+            batch: List[PendingRequest] = []
+            while self.pending and len(batch) < self.max_batch_size:
+                batch.append(self.pending.pop(0))
+            # Wait up to batch_timeout_ms for more requests to accumulate.
+            # After each new arrival, wait an additional short settle period
+            # so that a burst of HTTP requests all land in the same batch.
             deadline = time.time() + self.batch_timeout_ms / 1000.0
+            settle_ms = 0.01  # 10ms settle after each new arrival
             while len(batch) < self.max_batch_size:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
+                wait_time = min(remaining, settle_ms)
                 if not self.pending:
-                    self.cv.wait(timeout=remaining)
-                while self.pending and len(batch) < self.max_batch_size:
-                    batch.append(self.pending.pop(0))
+                    self.cv.wait(timeout=wait_time)
+                if self.pending:
+                    while self.pending and len(batch) < self.max_batch_size:
+                        batch.append(self.pending.pop(0))
+                    # Reset settle: wait a bit more for stragglers
+                    deadline = min(deadline, time.time() + settle_ms)
+                else:
+                    # Nothing arrived during wait — if we already have items, stop waiting
+                    if batch:
+                        break
             return batch
 
     def _normalize_messages(
@@ -388,7 +418,8 @@ class BatchedOpenAIServer:
             bsz = len(prompt_tokens)
             prompt_lens = [len(t) for t in prompt_tokens]
             total_len = min(self.model.max_seq_len, max(p + m for p, m in zip(prompt_lens, max_new_tokens)))
-            _log(f"generate bsz={bsz}, prompt_lens={prompt_lens[:5]}{'...' if bsz>5 else ''}, total_len={total_len}, max_seq_len={self.model.max_seq_len}")
+            if self.global_rank == 0:
+                _log(f"generate bsz={bsz}, prompt_lens={prompt_lens[:5]}{'...' if bsz>5 else ''}, total_len={total_len}, max_seq_len={self.model.max_seq_len}")
             tokens = torch.full((bsz, total_len), -1, dtype=torch.long, device="cuda")
             for i, prompt in enumerate(prompt_tokens):
                 tokens[i, :len(prompt)] = torch.tensor(prompt, dtype=torch.long, device="cuda")
@@ -578,6 +609,14 @@ def build_true_stream_response(handle: RequestHandle, request_id: str, created: 
 def create_app(engine: BatchedOpenAIServer) -> FastAPI:
     app = FastAPI()
 
+    @app.on_event("startup")
+    async def _setup_thread_pool():
+        loop = asyncio.get_event_loop()
+        loop.set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=256)
+        )
+        _log("thread pool executor set to 256 workers")
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "model": engine.model_name}
@@ -598,15 +637,13 @@ def create_app(engine: BatchedOpenAIServer) -> FastAPI:
         }
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(body: ChatCompletionRequest):
+    def chat_completions(body: ChatCompletionRequest):
         request_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         handle = engine.submit(body, request_id=request_id, created=created)
         if body.stream:
-            # True streaming: return SSE response immediately; tokens are pushed
-            # by the scheduler thread as they are generated.
             return build_true_stream_response(handle, request_id, created, engine.model_name)
-        await asyncio.to_thread(handle.event.wait)
+        handle.event.wait()
         if handle.error is not None:
             raise HTTPException(status_code=400, detail=str(handle.error))
         return JSONResponse(handle.result)
@@ -661,7 +698,7 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-name", type=str, default="deepseek-v4-flash")
     parser.add_argument("--max-batch-size", type=int, default=64)
-    parser.add_argument("--batch-timeout-ms", type=int, default=50)
+    parser.add_argument("--batch-timeout-ms", type=int, default=500)
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument("--max-batch-total-tokens", type=int, default=0)
     parser.add_argument("--release-kv-after-batch", action="store_true")
@@ -699,7 +736,11 @@ def main():
         engine.start()
         app = create_app(engine)
         try:
-            uvicorn.run(app, host=args.host, port=args.port, workers=1)
+            uvicorn.run(
+                app, host=args.host, port=args.port, workers=1,
+                loop="uvloop" if _has_uvloop() else "auto",
+                http="httptools" if _has_httptools() else "auto",
+            )
         finally:
             engine.shutdown()
             payloads = [{"type": "shutdown"}]
