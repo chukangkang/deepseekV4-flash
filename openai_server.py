@@ -123,6 +123,7 @@ class BatchedOpenAIServer:
         release_kv_after_batch: bool,
         model_name: str,
         max_queue_size: int,
+        request_timeout_s: int = 120,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -140,6 +141,7 @@ class BatchedOpenAIServer:
         self.release_kv_after_batch = release_kv_after_batch
         self.model_name = model_name
         self.max_queue_size = max_queue_size
+        self.request_timeout_s = request_timeout_s
         self.pending: List[PendingRequest] = []
         self.cv = threading.Condition()
         self.stopping = False
@@ -274,8 +276,16 @@ class BatchedOpenAIServer:
         )
 
     def _process_batch(self, batch: List[PendingRequest]):
-        prepared: List[PreparedRequest] = []
+        # Drop requests that have been waiting too long (client likely timed out)
+        now = int(time.time())
+        live_batch: List[PendingRequest] = []
         for pending in batch:
+            if now - pending.created > self.request_timeout_s:
+                pending.handle.set_error(TimeoutError(f"request waited {now - pending.created}s in queue, dropped"))
+            else:
+                live_batch.append(pending)
+        prepared: List[PreparedRequest] = []
+        for pending in live_batch:
             try:
                 prepared.append(self._prepare_request(pending))
             except Exception as exc:
@@ -640,13 +650,14 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-name", type=str, default="deepseek-v4-flash")
-    parser.add_argument("--max-batch-size", type=int, default=8)
-    parser.add_argument("--batch-timeout-ms", type=int, default=8)
-    parser.add_argument("--prefill-chunk-size", type=int, default=256)
+    parser.add_argument("--max-batch-size", type=int, default=64)
+    parser.add_argument("--batch-timeout-ms", type=int, default=50)
+    parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument("--max-batch-total-tokens", type=int, default=0)
     parser.add_argument("--release-kv-after-batch", action="store_true")
     parser.add_argument("--max-queue-size", type=int, default=1024)
     parser.add_argument("--max-seq-len", type=int, default=0)
+    parser.add_argument("--request-timeout-s", type=int, default=120, help="Drop queued requests older than this (seconds)")
     args = parser.parse_args()
 
     model, tokenizer, model_args, ctrl_group, global_rank, pp_rank, pp_peer_rank = init_runtime(
@@ -672,6 +683,7 @@ def main():
         release_kv_after_batch=args.release_kv_after_batch,
         model_name=args.model_name,
         max_queue_size=args.max_queue_size,
+        request_timeout_s=args.request_timeout_s,
     )
     if global_rank == 0:
         engine.start()
