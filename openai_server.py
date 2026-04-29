@@ -821,19 +821,26 @@ def create_app(engine: BatchedOpenAIServer) -> FastAPI:
     return app
 
 
-@torch.inference_mode()
-def _warmup_pp(model, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size):
+def _warmup_pp(pp_rank, pp_peer_rank):
     """Pre-create NCCL P2P communicators so the first real request doesn't pay the lazy-init cost.
+    Only warms up the P2P channels — avoids running model forward (which triggers slow JIT kernel compilation).
     Called by ALL ranks from init_runtime (before the worker/scheduler split)."""
     _log("warming up PP communicators...")
-    dummy_ids = torch.zeros(1, 1, dtype=torch.long, device="cuda")
-    # Run two dummy forward+PP rounds to trigger both send→recv and recv→send communicator creation
-    for _ in range(2):
-        pp_next_token(
-            model, dummy_ids, 0, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
-            [0.0], [1.0], 0,
-        )
-    model.reset_caches(release=True)
+    dummy = torch.zeros(1, dtype=torch.bfloat16, device="cuda")
+    # Round 1: stage0→stage1
+    if pp_rank == 0:
+        dist.send(dummy.contiguous(), dst=pp_peer_rank)
+        dist.recv(dummy, src=pp_peer_rank)
+    else:
+        dist.recv(dummy, src=pp_peer_rank)
+        dist.send(dummy.contiguous(), dst=pp_peer_rank)
+    # Round 2: stage1→stage0 (reverse direction, creates the other communicator)
+    if pp_rank == 0:
+        dist.recv(dummy, src=pp_peer_rank)
+        dist.send(dummy.contiguous(), dst=pp_peer_rank)
+    else:
+        dist.send(dummy.contiguous(), dst=pp_peer_rank)
+        dist.recv(dummy, src=pp_peer_rank)
     torch.cuda.synchronize()
     _log("PP warmup done")
 
@@ -874,7 +881,7 @@ def init_runtime(ckpt_path: str, config_path: str, max_batch_size: int, max_seq_
     shard_file = os.path.join(ckpt_path, f"model{tp_rank}-mp{TP_SIZE}.safetensors")
     load_pp_weights(model, shard_file, pp_rank, pp_size)
     torch.set_default_device("cuda")
-    _warmup_pp(model, pp_rank, pp_peer_rank, args.hc_mult, args.dim, args.vocab_size)
+    _warmup_pp(pp_rank, pp_peer_rank)
     return model, tokenizer, args, ctrl_group, global_rank, pp_rank, pp_peer_rank
 
 
