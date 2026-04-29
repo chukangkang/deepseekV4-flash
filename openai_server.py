@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import os
 import queue
 import sys
@@ -12,8 +11,8 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Union
 
-logger = logging.getLogger("openai_server")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+def _log(msg):
+    print(f"[openai_server] {msg}", flush=True)
 
 import torch
 import torch.distributed as dist
@@ -197,7 +196,7 @@ class BatchedOpenAIServer:
             batch = self._dequeue_batch()
             if not batch:
                 continue
-            logger.info(f"[scheduler] dequeued batch of {len(batch)} requests, pending remaining: {len(self.pending)}")
+            _log(f"dequeued batch of {len(batch)} requests, pending remaining: {len(self.pending)}")
             self._process_batch(batch)
 
     def _dequeue_batch(self) -> List[PendingRequest]:
@@ -318,12 +317,12 @@ class BatchedOpenAIServer:
                 "max_new_tokens": [item.max_new_tokens for item in subbatch],
             }
             try:
-                logger.info(f"[scheduler] broadcasting sub-batch of {len(subbatch)} requests, prompt_lens={[len(item.prompt_tokens) for item in subbatch]}")
+                _log(f"broadcasting sub-batch of {len(subbatch)} requests, prompt_lens={[len(item.prompt_tokens) for item in subbatch]}")
                 t0 = time.time()
                 outputs = self._broadcast_and_generate(payload, stream_ctxs)
                 elapsed = time.time() - t0
                 total_gen = sum(len(o['completion_tokens']) for o in outputs)
-                logger.info(f"[scheduler] sub-batch done in {elapsed:.1f}s, total_gen_tokens={total_gen}, tok/s={total_gen/max(elapsed,0.001):.1f}")
+                _log(f"sub-batch done in {elapsed:.1f}s, total_gen_tokens={total_gen}, tok/s={total_gen/max(elapsed,0.001):.1f}")
                 for item, output, sctx in zip(subbatch, outputs, stream_ctxs):
                     if sctx is not None:
                         self._finalize_stream(item, output, sctx)
@@ -389,7 +388,7 @@ class BatchedOpenAIServer:
             bsz = len(prompt_tokens)
             prompt_lens = [len(t) for t in prompt_tokens]
             total_len = min(self.model.max_seq_len, max(p + m for p, m in zip(prompt_lens, max_new_tokens)))
-            logger.info(f"[generate] bsz={bsz}, prompt_lens={prompt_lens[:5]}{'...' if bsz>5 else ''}, total_len={total_len}, max_seq_len={self.model.max_seq_len}")
+            _log(f"generate bsz={bsz}, prompt_lens={prompt_lens[:5]}{'...' if bsz>5 else ''}, total_len={total_len}, max_seq_len={self.model.max_seq_len}")
             tokens = torch.full((bsz, total_len), -1, dtype=torch.long, device="cuda")
             for i, prompt in enumerate(prompt_tokens):
                 tokens[i, :len(prompt)] = torch.tensor(prompt, dtype=torch.long, device="cuda")
