@@ -135,26 +135,62 @@ def pp_forward(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim,
         return logits
 
 
+_pp_profile_steps = 0
+_pp_profile_fwd = 0.0
+_pp_profile_wait = 0.0
+
 def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
                   temperatures, top_ps, seed: int, h_buf=None, tok_buf=None):
+    global _pp_profile_steps, _pp_profile_fwd, _pp_profile_wait
     bsz, seqlen = input_ids.size()
+    _do_profile = seqlen == 1  # only profile decode steps
     if pp_rank == 0:
+        if _do_profile:
+            torch.cuda.synchronize()
+            import time; _t0 = time.perf_counter()
         h = model.forward(input_ids, start_pos)
+        if _do_profile:
+            torch.cuda.synchronize()
+            _t1 = time.perf_counter()
         dist.send(h.contiguous(), dst=pp_peer_rank)
         if tok_buf is not None and tok_buf.shape[0] >= bsz:
             next_token = tok_buf[:bsz]
         else:
             next_token = torch.empty(bsz, dtype=torch.long, device="cuda")
         dist.recv(next_token, src=pp_peer_rank)
+        if _do_profile:
+            _t2 = time.perf_counter()
+            _pp_profile_fwd += (_t1 - _t0)
+            _pp_profile_wait += (_t2 - _t1)
+            _pp_profile_steps += 1
+            if _pp_profile_steps % 50 == 0:
+                avg_fwd = _pp_profile_fwd / _pp_profile_steps * 1000
+                avg_wait = _pp_profile_wait / _pp_profile_steps * 1000
+                print(f"[pp_profile] stage0 over {_pp_profile_steps} steps: "
+                      f"fwd={avg_fwd:.1f}ms, send+wait_stage1={avg_wait:.1f}ms, "
+                      f"total={avg_fwd+avg_wait:.1f}ms", flush=True)
         return next_token
     if h_buf is not None and h_buf.shape[0] >= bsz and h_buf.shape[1] >= seqlen:
         h = h_buf[:bsz, :seqlen]
     else:
         h = torch.empty(bsz, seqlen, hc_mult, dim, dtype=torch.bfloat16, device="cuda")
     dist.recv(h, src=pp_peer_rank)
+    if _do_profile:
+        torch.cuda.synchronize()
+        import time; _t0 = time.perf_counter()
     logits = model.forward(input_ids, start_pos, hidden_states=h)
     next_token = sample_batch(logits, temperatures, top_ps, seed)
+    if _do_profile:
+        torch.cuda.synchronize()
+        _t1 = time.perf_counter()
     dist.send(next_token.contiguous(), dst=pp_peer_rank)
+    if _do_profile:
+        _pp_profile_fwd += (_t1 - _t0)
+        _pp_profile_steps += 1
+        if _pp_profile_steps % 50 == 0:
+            avg_fwd = _pp_profile_fwd / _pp_profile_steps * 1000
+            print(f"[pp_profile] stage1 over {_pp_profile_steps} steps: "
+                  f"fwd+sample={avg_fwd:.1f}ms", flush=True)
     return next_token
 
 
