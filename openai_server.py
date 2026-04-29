@@ -228,7 +228,7 @@ class BatchedOpenAIServer:
             # After each new arrival, wait an additional short settle period
             # so that a burst of HTTP requests all land in the same batch.
             deadline = time.time() + self.batch_timeout_ms / 1000.0
-            settle_ms = 0.01  # 10ms settle after each new arrival
+            settle_ms = 0.1  # 100ms settle after each new arrival
             while len(batch) < self.max_batch_size:
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -738,7 +738,7 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-name", type=str, default="deepseek-v4-flash")
     parser.add_argument("--max-batch-size", type=int, default=64)
-    parser.add_argument("--batch-timeout-ms", type=int, default=500)
+    parser.add_argument("--batch-timeout-ms", type=int, default=5000)
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument("--max-batch-total-tokens", type=int, default=0)
     parser.add_argument("--release-kv-after-batch", action="store_true")
