@@ -135,13 +135,16 @@ def pp_forward(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim,
         return logits
 
 
-_pp_profile_steps = 0
-_pp_profile_fwd = 0.0
-_pp_profile_wait = 0.0
+_pp_prof_steps = 0
+_pp_prof_fwd_total = 0.0
+_pp_prof_wait_total = 0.0
+_pp_prof_fwd_window = 0.0
+_pp_prof_wait_window = 0.0
+_PP_PROF_INTERVAL = 50
 
 def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
                   temperatures, top_ps, seed: int, h_buf=None, tok_buf=None):
-    global _pp_profile_steps, _pp_profile_fwd, _pp_profile_wait
+    global _pp_prof_steps, _pp_prof_fwd_total, _pp_prof_wait_total, _pp_prof_fwd_window, _pp_prof_wait_window
     bsz, seqlen = input_ids.size()
     _do_profile = seqlen == 1  # only profile decode steps
     if pp_rank == 0:
@@ -159,16 +162,26 @@ def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, d
             next_token = torch.empty(bsz, dtype=torch.long, device="cuda")
         dist.recv(next_token, src=pp_peer_rank)
         if _do_profile:
+            torch.cuda.synchronize()  # wait for NCCL recv to actually complete
             _t2 = time.perf_counter()
-            _pp_profile_fwd += (_t1 - _t0)
-            _pp_profile_wait += (_t2 - _t1)
-            _pp_profile_steps += 1
-            if _pp_profile_steps % 50 == 0:
-                avg_fwd = _pp_profile_fwd / _pp_profile_steps * 1000
-                avg_wait = _pp_profile_wait / _pp_profile_steps * 1000
-                print(f"[pp_profile] stage0 over {_pp_profile_steps} steps: "
-                      f"fwd={avg_fwd:.1f}ms, send+wait_stage1={avg_wait:.1f}ms, "
-                      f"total={avg_fwd+avg_wait:.1f}ms", flush=True)
+            fwd_ms = (_t1 - _t0) * 1000
+            wait_ms = (_t2 - _t1) * 1000
+            _pp_prof_fwd_total += fwd_ms
+            _pp_prof_wait_total += wait_ms
+            _pp_prof_fwd_window += fwd_ms
+            _pp_prof_wait_window += wait_ms
+            _pp_prof_steps += 1
+            if _pp_prof_steps % _PP_PROF_INTERVAL == 0:
+                avg_fwd = _pp_prof_fwd_total / _pp_prof_steps
+                avg_wait = _pp_prof_wait_total / _pp_prof_steps
+                win_fwd = _pp_prof_fwd_window / _PP_PROF_INTERVAL
+                win_wait = _pp_prof_wait_window / _PP_PROF_INTERVAL
+                print(f"[pp_profile] stage0 step {_pp_prof_steps}: "
+                      f"last{_PP_PROF_INTERVAL} fwd={win_fwd:.0f}ms wait={win_wait:.0f}ms total={win_fwd+win_wait:.0f}ms | "
+                      f"cumul fwd={avg_fwd:.0f}ms wait={avg_wait:.0f}ms total={avg_fwd+avg_wait:.0f}ms",
+                      flush=True)
+                _pp_prof_fwd_window = 0.0
+                _pp_prof_wait_window = 0.0
         return next_token
     if h_buf is not None and h_buf.shape[0] >= bsz and h_buf.shape[1] >= seqlen:
         h = h_buf[:bsz, :seqlen]
@@ -184,13 +197,6 @@ def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, d
         torch.cuda.synchronize()
         _t1 = time.perf_counter()
     dist.send(next_token.contiguous(), dst=pp_peer_rank)
-    if _do_profile:
-        _pp_profile_fwd += (_t1 - _t0)
-        _pp_profile_steps += 1
-        if _pp_profile_steps % 50 == 0:
-            avg_fwd = _pp_profile_fwd / _pp_profile_steps * 1000
-            print(f"[pp_profile] stage1 over {_pp_profile_steps} steps: "
-                  f"fwd+sample={avg_fwd:.1f}ms", flush=True)
     return next_token
 
 
