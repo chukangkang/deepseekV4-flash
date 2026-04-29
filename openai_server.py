@@ -331,8 +331,8 @@ class BatchedOpenAIServer:
             prev_pos = 0
             shared_prefill = min(prompt_lens)
             logits = None
-            while prev_pos < shared_prefill:
-                cur_pos = min(shared_prefill, prev_pos + self.prefill_chunk_size)
+            while prev_pos + self.prefill_chunk_size < shared_prefill:
+                cur_pos = prev_pos + self.prefill_chunk_size
                 input_ids = tokens[:, prev_pos:cur_pos]
                 logits = pp_forward(
                     self.model,

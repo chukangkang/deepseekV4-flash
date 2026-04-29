@@ -3,7 +3,7 @@
 # Usage: bash scripts/convert_pp2_tp8.sh <hf_ckpt_path> <save_path>
 #
 # Non-expert weights: FP8 (float8_e4m3fn)
-# Expert weights:     FP4 (float4_e2m1fn)
+# Expert weights:     INT4 (symmetric, uint8-packed) — converted from FP4
 # Shards across 8 TP ranks. Each shard contains ALL layers.
 # Pipeline parallelism (PP=2) is handled at runtime by loading
 # only the relevant layers per stage (strict=False in load_model).
@@ -43,7 +43,8 @@ python3 ${PROJECT_DIR}/convert.py \
     --hf-ckpt-path ${HF_CKPT_PATH} \
     --save-path ${SAVE_PATH} \
     --n-experts ${EXPERTS} \
-    --model-parallel ${MP}
+    --model-parallel ${MP} \
+    --expert-dtype int4
 
 echo ""
 echo "Conversion complete. Output files:"

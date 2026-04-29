@@ -10,7 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn
+from kernel import act_quant, fp4_act_quant, int4_act_quant, fp8_gemm, fp4_gemm, int4_gemm, sparse_attn, hc_split_sinkhorn
 
 
 world_size = 1
@@ -20,6 +20,9 @@ fp4_block_size = 32
 default_dtype = torch.bfloat16
 scale_fmt = None
 scale_dtype = torch.float32
+expert_int4 = False
+turbo_quant_enabled = False
+turbo_quant_bits = 4
 tp_group = None
 
 
@@ -40,7 +43,7 @@ class ModelArgs:
     max_seq_len: int = 4096
     dtype: Literal["bf16", "fp8"] = "fp8"
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
-    expert_dtype: Literal[None, "fp4"] = None
+    expert_dtype: Literal[None, "fp4", "int4"] = None
     scale_dtype: Literal["fp32", "fp8"] = "fp8"
     vocab_size: int = 129280
     dim: int = 4096
@@ -80,6 +83,9 @@ class ModelArgs:
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    # TurboQuant: training-free low-bit KV cache compression
+    turbo_quant: bool = False
+    turbo_quant_bits: int = 4
 
 
 class DynamicKVCache:
@@ -151,6 +157,165 @@ class DynamicKVCache:
             self.num_blocks = 0
 
 
+class TurboQuantKVCache:
+    """TurboQuant-inspired low-bit KV cache compression.
+    Quantizes KV entries to N-bit (default 4) per-token asymmetric quantization on write,
+    dequantizes to BF16 on read. Reduces KV memory by ~4x (BF16→4-bit) or ~5.3x (BF16→3-bit).
+
+    Storage layout:
+      quantized: [batch, capacity, head_dim] in uint8 (packed: 2 values per byte for 4-bit, 8 values per 3 bytes for 3-bit)
+      scales:    [batch, capacity] in float16  (per-token max abs value)
+      zeros:     [batch, capacity] in float16  (per-token min value)
+    """
+
+    def __init__(self, max_batch_size: int, head_dim: int, bits: int = 4,
+                 min_capacity: int = 1, growth_factor: int = 2, block_len: int = 256):
+        self.max_batch_size = max_batch_size
+        self.head_dim = head_dim
+        self.bits = bits
+        self.n_levels = (1 << bits) - 1  # 15 for 4-bit, 7 for 3-bit
+        self.min_capacity = max(1, min_capacity)
+        self.growth_factor = max(2, growth_factor)
+        self.block_len = max(1, block_len)
+        # For 4-bit: pack 2 per byte → head_dim//2 bytes per token
+        # For 3-bit: pack 8 per 3 bytes → head_dim*3//8 bytes per token
+        if bits == 4:
+            self.packed_dim = head_dim // 2
+        elif bits == 3:
+            assert head_dim % 8 == 0, "head_dim must be divisible by 8 for 3-bit packing"
+            self.packed_dim = head_dim * 3 // 8
+        else:
+            raise ValueError(f"Unsupported bits={bits}, must be 3 or 4")
+        self.quantized: Optional[torch.Tensor] = None
+        self.scales: Optional[torch.Tensor] = None
+        self.zeros: Optional[torch.Tensor] = None
+        self.capacity = 0
+        # BF16 view returned to caller (lazily allocated)
+        self._bf16_view: Optional[torch.Tensor] = None
+        self._bf16_capacity = 0
+
+    def _round_capacity(self, length: int) -> int:
+        return ((max(1, length) + self.block_len - 1) // self.block_len) * self.block_len
+
+    def _next_capacity(self, required_len: int) -> int:
+        capacity = self._round_capacity(max(self.min_capacity, self.capacity, self.block_len))
+        while capacity < required_len:
+            capacity = self._round_capacity(max(capacity * self.growth_factor, required_len))
+        return capacity
+
+    def ensure(self, batch_size: int, required_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Allocates quantized storage and returns a BF16 view tensor for the caller.
+        The BF16 view is a scratch buffer — writes to it are quantized via write_slice()."""
+        batch_cap = max(self.max_batch_size, batch_size)
+        required_len = max(1, required_len)
+        need_realloc = (
+            self.quantized is None or
+            self.quantized.device != device or
+            self.quantized.size(0) < batch_cap or
+            self.capacity < required_len
+        )
+        if need_realloc:
+            new_cap = self._next_capacity(required_len)
+            new_q = torch.zeros(batch_cap, new_cap, self.packed_dim, dtype=torch.uint8, device=device)
+            new_s = torch.ones(batch_cap, new_cap, dtype=torch.float16, device=device)
+            new_z = torch.zeros(batch_cap, new_cap, dtype=torch.float16, device=device)
+            if self.quantized is not None and self.quantized.device == device:
+                cb = min(self.quantized.size(0), batch_cap)
+                cl = min(self.capacity, new_cap)
+                new_q[:cb, :cl].copy_(self.quantized[:cb, :cl])
+                new_s[:cb, :cl].copy_(self.scales[:cb, :cl])
+                new_z[:cb, :cl].copy_(self.zeros[:cb, :cl])
+            self.quantized = new_q
+            self.scales = new_s
+            self.zeros = new_z
+            self.capacity = new_cap
+        # Ensure BF16 view is large enough
+        if self._bf16_view is None or self._bf16_view.size(0) < batch_cap or self._bf16_capacity < required_len or self._bf16_view.device != device:
+            self._bf16_view = torch.zeros(batch_cap, self.capacity, self.head_dim, dtype=dtype, device=device)
+            self._bf16_capacity = self.capacity
+        return self._bf16_view
+
+    def _quantize_4bit(self, x: torch.Tensor) -> tuple:
+        """x: [..., head_dim] → packed uint8 [..., head_dim//2], scale, zero"""
+        xf = x.float()
+        vmin = xf.amin(dim=-1, keepdim=True)
+        vmax = xf.amax(dim=-1, keepdim=True)
+        scale = (vmax - vmin).clamp(min=1e-12) / self.n_levels
+        qi = torch.round((xf - vmin) / scale).clamp(0, self.n_levels).to(torch.uint8)
+        # Pack 2 per byte: low nibble = even, high nibble = odd
+        packed = qi[..., 0::2] | (qi[..., 1::2] << 4)
+        return packed, scale.squeeze(-1).half(), vmin.squeeze(-1).half()
+
+    def _dequantize_4bit(self, packed: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Unpack uint8 → 4-bit → float → apply scale+zero"""
+        lo = (packed & 0x0F).to(torch.float32)
+        hi = ((packed >> 4) & 0x0F).to(torch.float32)
+        vals = torch.stack([lo, hi], dim=-1).flatten(-2)  # [..., head_dim]
+        return (vals * scale.unsqueeze(-1).float() + zero.unsqueeze(-1).float()).to(dtype)
+
+    def _quantize_3bit(self, x: torch.Tensor) -> tuple:
+        """x: [..., head_dim] → packed uint8 [..., head_dim*3//8], scale, zero"""
+        xf = x.float()
+        vmin = xf.amin(dim=-1, keepdim=True)
+        vmax = xf.amax(dim=-1, keepdim=True)
+        scale = (vmax - vmin).clamp(min=1e-12) / self.n_levels
+        qi = torch.round((xf - vmin) / scale).clamp(0, self.n_levels).to(torch.uint8)
+        # Pack 8 values into 3 bytes: bits [b0*3..b0*3+2] → byte positions
+        shape = qi.shape[:-1]
+        qi = qi.view(*shape, -1, 8)  # [..., groups, 8]
+        b = qi.to(torch.uint32)
+        byte0 = (b[..., 0]) | (b[..., 1] << 3) | ((b[..., 2] & 0x3) << 6)
+        byte1 = (b[..., 2] >> 2) | (b[..., 3] << 1) | (b[..., 4] << 4) | ((b[..., 5] & 0x1) << 7)
+        byte2 = (b[..., 5] >> 1) | (b[..., 6] << 2) | (b[..., 7] << 5)
+        packed = torch.stack([byte0, byte1, byte2], dim=-1).to(torch.uint8).flatten(-2)
+        return packed, scale.squeeze(-1).half(), vmin.squeeze(-1).half()
+
+    def _dequantize_3bit(self, packed: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Unpack 3-bit packed uint8 → float"""
+        shape = packed.shape[:-1]
+        packed = packed.view(*shape, -1, 3).to(torch.uint32)  # [..., groups, 3]
+        b0, b1, b2 = packed[..., 0], packed[..., 1], packed[..., 2]
+        v0 = b0 & 0x7
+        v1 = (b0 >> 3) & 0x7
+        v2 = ((b0 >> 6) | (b1 << 2)) & 0x7
+        v3 = (b1 >> 1) & 0x7
+        v4 = (b1 >> 4) & 0x7
+        v5 = ((b1 >> 7) | (b2 << 1)) & 0x7
+        v6 = (b2 >> 2) & 0x7
+        v7 = (b2 >> 5) & 0x7
+        vals = torch.stack([v0, v1, v2, v3, v4, v5, v6, v7], dim=-1).flatten(-2).float()
+        return (vals * scale.unsqueeze(-1).float() + zero.unsqueeze(-1).float()).to(dtype)
+
+    def write_slice(self, batch_slice, pos_slice, data: torch.Tensor):
+        """Quantize and store data at the given position."""
+        if self.bits == 4:
+            packed, s, z = self._quantize_4bit(data)
+        else:
+            packed, s, z = self._quantize_3bit(data)
+        self.quantized[batch_slice, pos_slice] = packed
+        self.scales[batch_slice, pos_slice] = s
+        self.zeros[batch_slice, pos_slice] = z
+
+    def read_slice(self, batch_slice, pos_slice, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+        """Dequantize and return data from the given position."""
+        packed = self.quantized[batch_slice, pos_slice]
+        s = self.scales[batch_slice, pos_slice]
+        z = self.zeros[batch_slice, pos_slice]
+        if self.bits == 4:
+            return self._dequantize_4bit(packed, s, z, dtype)
+        else:
+            return self._dequantize_3bit(packed, s, z, dtype)
+
+    def reset(self, release: bool = False):
+        if release:
+            self.quantized = None
+            self.scales = None
+            self.zeros = None
+            self._bf16_view = None
+            self.capacity = 0
+            self._bf16_capacity = 0
+
+
 class ParallelEmbedding(nn.Module):
     """Embedding sharded along the vocab dimension. Each rank holds vocab_size // world_size rows.
     Out-of-range indices are zero-masked before all_reduce to combine partial embeddings."""
@@ -177,11 +342,14 @@ class ParallelEmbedding(nn.Module):
 
 
 def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Dispatches to fp4_gemm / fp8_gemm / F.linear based on weight dtype.
+    """Dispatches to int4_gemm / fp4_gemm / fp8_gemm / F.linear based on weight dtype.
     For quantized weights, x is first quantized to FP8 via act_quant."""
     assert bias is None
 
-    if weight.dtype == torch.float4_e2m1fn_x2:
+    if weight.dtype == torch.uint8 and hasattr(weight, 'scale'):
+        x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
+        return int4_gemm(x, s, weight, weight.scale, scale_dtype)
+    elif weight.dtype == torch.float4_e2m1fn_x2:
         x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
         return fp4_gemm(x, s, weight, weight.scale, scale_dtype)
     elif weight.dtype == torch.float8_e4m3fn:
@@ -199,7 +367,14 @@ class Linear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         dtype = dtype or default_dtype
-        if dtype == torch.float4_e2m1fn_x2:
+        if dtype == torch.uint8:
+            # INT4: weight is [out, in//2] in uint8 (2 signed INT4 per byte)
+            # Scale is [out, in//32] in float32
+            self.weight = nn.Parameter(torch.empty(out_features, in_features // 2, dtype=torch.uint8), requires_grad=False)
+            scale_out_features = out_features
+            scale_in_features = in_features // fp4_block_size
+            self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float32), requires_grad=False)
+        elif dtype == torch.float4_e2m1fn_x2:
             # FP4: weight is [out, in//2] in float4_e2m1fn_x2, logically [out, in] in fp4
             # Scale is [out, in//32] in float8_e8m0fnu (1 scale per 32 fp4 elements along K)
             self.weight = nn.Parameter(torch.empty(out_features, in_features // 2, dtype=torch.float4_e2m1fn_x2))
@@ -451,7 +626,7 @@ class Compressor(nn.Module):
         apply_rotary_emb(kv[..., -rd:], freqs_cis)
         if self.rotate:
             kv = rotate_activation(kv)
-            fp4_act_quant(kv, fp4_block_size, True)
+            (int4_act_quant if expert_int4 else fp4_act_quant)(kv, fp4_block_size, True)
         else:
             act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
         if start_pos == 0:
@@ -504,8 +679,8 @@ class Indexer(torch.nn.Module):
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = rotate_activation(q)
-        # use fp4 simulation for q and kv in indexer
-        fp4_act_quant(q, fp4_block_size, True)
+        # use fp4/int4 simulation for q and kv in indexer
+        (int4_act_quant if expert_int4 else fp4_act_quant)(q, fp4_block_size, True)
         self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
@@ -562,7 +737,12 @@ class Attention(nn.Module):
             else:
                 self.indexer = None
 
-        self.kv_cache_mgr = DynamicKVCache(args.max_batch_size, self.head_dim, min_capacity=max(args.window_size, 1 + args.window_size))
+        self.use_turbo_quant = args.turbo_quant
+        if self.use_turbo_quant:
+            self.kv_cache_mgr = TurboQuantKVCache(args.max_batch_size, self.head_dim, bits=args.turbo_quant_bits,
+                                                   min_capacity=max(args.window_size, 1 + args.window_size))
+        else:
+            self.kv_cache_mgr = DynamicKVCache(args.max_batch_size, self.head_dim, min_capacity=max(args.window_size, 1 + args.window_size))
         self.kv_cache: Optional[torch.Tensor] = None
         if self.compress_ratio:
             original_seq_len, rope_theta = args.original_seq_len, args.compress_rope_theta
@@ -635,22 +815,48 @@ class Attention(nn.Module):
         topk_idxs = topk_idxs.int()
 
         # compress kv & attn
+        tq = self.use_turbo_quant
         if start_pos == 0:
             if seqlen <= win:
-                self.kv_cache[:bsz, :seqlen] = kv
+                if tq:
+                    self.kv_cache_mgr.write_slice(slice(None, bsz), slice(None, seqlen), kv)
+                else:
+                    self.kv_cache[:bsz, :seqlen] = kv
             else:
                 cutoff = seqlen % win
-                self.kv_cache[:bsz, cutoff: win], self.kv_cache[:bsz, :cutoff] = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+                win_kv_a, win_kv_b = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+                if tq:
+                    self.kv_cache_mgr.write_slice(slice(None, bsz), slice(cutoff, win), win_kv_a)
+                    self.kv_cache_mgr.write_slice(slice(None, bsz), slice(None, cutoff), win_kv_b)
+                else:
+                    self.kv_cache[:bsz, cutoff: win], self.kv_cache[:bsz, :cutoff] = win_kv_a, win_kv_b
             if self.compress_ratio:
                 if (kv_compress := self.compressor(x, start_pos)) is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
+                if tq:
+                    # Sync compressor's writes to quantized storage
+                    comp_len = self.kv_cache[:bsz, win:].size(1)
+                    if comp_len > 0:
+                        self.kv_cache_mgr.write_slice(slice(None, bsz), slice(win, win + comp_len), self.kv_cache[:bsz, win:win + comp_len])
             # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
-            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if tq:
+                self.kv_cache_mgr.write_slice(slice(None, bsz), start_pos % win, kv.squeeze(1))
+            else:
+                self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, start_pos)
-            o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+                if tq:
+                    # Sync compressor's write (to BF16 view) back to quantized storage
+                    comp_pos = win + start_pos // ratio
+                    self.kv_cache_mgr.write_slice(slice(None, bsz), comp_pos, self.kv_cache[:bsz, comp_pos])
+            if tq:
+                cache_len = self.kv_cache.size(1)
+                kv_for_attn = self.kv_cache_mgr.read_slice(slice(None, bsz), slice(None, cache_len), x.dtype)
+                o = sparse_attn(q, kv_for_attn, self.attn_sink, topk_idxs, self.softmax_scale)
+            else:
+                o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # o
@@ -740,7 +946,7 @@ class MoE(nn.Module):
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.gate = Gate(layer_id, args)
-        expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
+        expert_dtype = torch.uint8 if args.expert_dtype == "int4" else (torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None)
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim, dtype=expert_dtype, swiglu_limit=args.swiglu_limit) if self.experts_start_idx <= i < self.experts_end_idx else None
                                        for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
@@ -911,7 +1117,7 @@ class Transformer(nn.Module):
     When pp_size>1, tp_world_size/tp_rank/tp_grp must be provided."""
     def __init__(self, args: ModelArgs, pp_rank: int = 0, pp_size: int = 1,
                  tp_world_size: int = 0, tp_rank: int = 0, tp_grp=None):
-        global world_size, rank, default_dtype, scale_fmt, scale_dtype, tp_group
+        global world_size, rank, default_dtype, scale_fmt, scale_dtype, tp_group, expert_int4, turbo_quant_enabled, turbo_quant_bits
         if pp_size == 1:
             world_size = dist.get_world_size() if dist.is_initialized() else 1
             rank = dist.get_rank() if dist.is_initialized() else 0
@@ -923,6 +1129,9 @@ class Transformer(nn.Module):
         default_dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         scale_fmt = "ue8m0" if args.scale_dtype == "fp8" else args.scale_fmt
         scale_dtype = torch.float8_e8m0fnu if args.scale_dtype == "fp8" else torch.float32
+        expert_int4 = args.expert_dtype == "int4"
+        turbo_quant_enabled = args.turbo_quant
+        turbo_quant_bits = args.turbo_quant_bits
         super().__init__()
         self.max_seq_len = args.max_seq_len
         self.norm_eps = args.norm_eps

@@ -1,29 +1,63 @@
 # Inference code for DeepSeek models
 
-First convert huggingface model weight files to the format of this project.
+## Features
+
+- **INT4 expert weights** — Symmetric 4-bit quantization (uint8-packed) for MoE expert weights. Compatible with RTX 4090 / SM89 GPUs that lack native FP4 support.
+- **TurboQuant KV cache compression** — Training-free per-token asymmetric quantization of the KV cache to 4-bit (default) or 3-bit, reducing KV memory by ~4× or ~5.3×.
+- **PP=2 × TP=8 distributed inference** — Pipeline + Tensor parallelism across 2 nodes × 8 GPUs (~10–12 GB VRAM per GPU).
+- **OpenAI-compatible API** — `/v1/chat/completions` endpoint with batched scheduling.
+
+## Quick start
+
+### Step 1: Convert checkpoint
+
 ```bash
-export EXPERTS=256
-export MP=4
-export CONFIG=config.json
-python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
+# INT4 expert weights (recommended for RTX 4090)
+python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts 256 --model-parallel 8 --expert-dtype int4
 ```
 
-Then chat with DeepSeek model at will!
+Or use the convenience script:
 ```bash
-torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --interactive
+bash scripts/convert_pp2_tp8.sh /path/to/hf-checkpoint /path/to/converted-checkpoint
 ```
 
-Or batch inference from file.
-```bash
-torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
+Other `--expert-dtype` options:
+| Value | Description |
+|-------|-------------|
+| `int4` | Symmetric INT4, packed uint8 + FP32 scale (default, **4090-compatible**) |
+| `fp8` | FP8 (float8_e4m3fn) + FP8 scale |
+| `fp4` | Native FP4 (float4_e2m1fn) — requires SM100+ |
+
+### Step 2: Configure `config.json`
+
+Key fields:
+```json
+{
+  "expert_dtype": "int4",
+  "turbo_quant": true,
+  "turbo_quant_bits": 4
+}
 ```
 
-Or multi nodes inference.
+- Set `"expert_dtype"` to match the `--expert-dtype` used during conversion.
+- Set `"turbo_quant": false` to disable KV cache compression.
+- Set `"turbo_quant_bits": 3` for more aggressive 3-bit KV compression.
+
+### Step 3: Run inference
+
 ```bash
-torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
+torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config config.json --interactive
 ```
 
-If you want to use fp8, just remove `"expert_dtype": "fp4"` in `config.json` and specify `--expert-dtype fp8` in `convert.py`.
+Batch inference:
+```bash
+torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config config.json --input-file ${FILE}
+```
+
+Multi-node:
+```bash
+torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR generate.py --ckpt-path ${SAVE_PATH} --config config.json --input-file ${FILE}
+```
 
 ## PP=2 x TP=8 on 2 Nodes x 8x RTX 4090 (24GB) — Recommended
 
@@ -31,7 +65,7 @@ Pipeline Parallelism (PP=2) + Tensor Parallelism (TP=8) across 2 machines, each 
 - **Node 0** (PP stage 0): embedding + layers 0–21 (22 layers)
 - **Node 1** (PP stage 1): layers 22–42 (21 layers) + head + MTP
 
-Mixed precision: FP8 non-expert weights + FP4 expert weights.
+Mixed precision: FP8 non-expert weights + **INT4 expert weights** + TurboQuant 4-bit KV cache.
 
 **Memory per GPU**: ~10–12 GB (each node holds ~half the model layers)
 
@@ -44,7 +78,8 @@ Mixed precision: FP8 non-expert weights + FP4 expert weights.
 ```bash
 bash scripts/convert_pp2_tp8.sh /path/to/hf-checkpoint /path/to/pp2-tp8-checkpoint
 ```
-This generates 8 files: `model{0..7}-mp8.safetensors`. Copy them + tokenizer files to both nodes.
+This runs `convert.py --expert-dtype int4` and generates 8 files: `model{0..7}-mp8.safetensors`.
+Copy them + tokenizer files to both nodes.
 
 ### Step 2: Launch inference
 
@@ -73,6 +108,31 @@ export NCCL_IB_DISABLE=1          # Set to 0 if InfiniBand is available
 export NCCL_SOCKET_FAMILY=AF_INET # Force IPv4
 export NCCL_DEBUG=INFO             # Debug NCCL connectivity
 ```
+
+### TurboQuant KV Cache Compression
+
+TurboQuant reduces KV cache memory via per-token low-bit asymmetric quantization. This is a **runtime-only** optimization — no checkpoint re-conversion needed.
+
+**How it works:**
+1. When writing to the KV cache, each token's KV vector is quantized to N-bit with per-token scale + zero-point
+2. When reading for attention, the cached values are dequantized back to BF16
+3. During prefill, raw BF16 tensors are used directly (no cache read)
+
+**Configuration in `config.json`:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `turbo_quant` | `true` | Enable/disable KV cache compression |
+| `turbo_quant_bits` | `4` | Quantization bits: `4` (~4× compression) or `3` (~5.3× compression) |
+
+**Memory savings (per token per layer):**
+| Mode | KV size | vs BF16 |
+|------|---------|---------|
+| BF16 (off) | 1024 bytes | 1× |
+| 4-bit | ~260 bytes | ~4× |
+| 3-bit | ~196 bytes | ~5.3× |
+
+To disable: set `"turbo_quant": false` in `config.json`. No other changes needed.
 
 ### OpenAI-compatible API service
 

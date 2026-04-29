@@ -17,6 +17,8 @@ FE8M0 = "float8_e8m0fnu"
 BF16 = "bfloat16"
 FP32 = "float32"
 INT32 = "int32"
+UINT8 = "uint8"
+INT8 = "int8"
 
 
 def fast_log2_ceil(x):
@@ -549,6 +551,216 @@ def fp4_gemm_kernel(N, K, out_dtype=BF16, accum_dtype=FP32, scale_dtype=FP32):
             T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return fp4_gemm_kernel_
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def int4_quant_kernel(N, block_size=32, in_dtype=BF16, scale_dtype=FP32, inplace=False):
+    """Block-wise symmetric INT4 quantization.
+    scale = max(|group|) / 7;  int4_val = round(clamp(x/s, -8, 7))
+    inplace=True  → fused quant+dequant back to BF16 (QAT round-trip)
+    inplace=False → packed uint8 output (2 signed INT4 per byte, low nibble first)"""
+    M = T.symbolic("M")
+    int4_max = 7.0
+    blk_m = 32
+    group_size = block_size
+    compute_dtype = FP32
+    out_dtype = in_dtype if inplace else UINT8
+    out_cols = N if inplace else N // 2
+
+    @T.prim_func
+    def int4_quant_kernel_(
+        X: T.Tensor[(M, N), in_dtype],
+        Y: T.Tensor[(M, out_cols), out_dtype],
+        S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
+            pid_m, pid_n,
+        ):
+            x_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            x_local = T.alloc_fragment((blk_m, group_size), in_dtype)
+            amax_local = T.alloc_fragment((blk_m,), compute_dtype)
+            s_local = T.alloc_fragment((blk_m,), compute_dtype)
+
+            for _ in T.Pipelined(1, num_stages=2):
+                T.copy(X[pid_m * blk_m, pid_n * group_size], x_shared)
+                T.copy(x_shared, x_local)
+                T.reduce_absmax(x_local, amax_local, dim=1)
+                for i in T.Parallel(blk_m):
+                    amax_local[i] = T.max(amax_local[i], 1e-12)
+                    s_local[i] = amax_local[i] / int4_max
+                for i in T.Parallel(blk_m):
+                    S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+                if inplace:
+                    y_local = T.alloc_fragment((blk_m, group_size), in_dtype)
+                    y_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+                    for i, j in T.Parallel(blk_m, group_size):
+                        y_local[i, j] = T.Cast(in_dtype,
+                            T.round(T.clamp(
+                                T.Cast(compute_dtype, x_local[i, j]) / s_local[i],
+                                -8.0, int4_max
+                            )) * s_local[i],
+                        )
+                    T.copy(y_local, y_shared)
+                    T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
+                else:
+                    q_local = T.alloc_fragment((blk_m, group_size), INT32)
+                    y_local_u8 = T.alloc_fragment((blk_m, group_size // 2), UINT8)
+                    y_shared_u8 = T.alloc_shared((blk_m, group_size // 2), UINT8)
+                    for i, j in T.Parallel(blk_m, group_size):
+                        q_local[i, j] = T.Cast(INT32,
+                            T.round(T.clamp(
+                                T.Cast(compute_dtype, x_local[i, j]) / s_local[i],
+                                -8.0, int4_max
+                            ))
+                        )
+                    for i, j in T.Parallel(blk_m, group_size // 2):
+                        lo = q_local[i, 2 * j] & 0x0F
+                        hi = q_local[i, 2 * j + 1] & 0x0F
+                        y_local_u8[i, j] = T.Cast(UINT8, lo | (hi << 4))
+                    T.copy(y_local_u8, y_shared_u8)
+                    T.copy(y_shared_u8, Y[pid_m * blk_m, pid_n * (group_size // 2)])
+
+    return int4_quant_kernel_
+
+
+def int4_act_quant(
+    x: torch.Tensor, block_size: int = 32, inplace: bool = False,
+) -> torch.Tensor:
+    """Block-wise INT4 symmetric quantization. inplace=True does fused quant+dequant back to BF16."""
+    N = x.size(-1)
+    assert N % block_size == 0
+    z = x.contiguous()
+    M = z.numel() // N
+    BLK_M = 32
+    M_al = ((M + BLK_M - 1) // BLK_M) * BLK_M
+    if M_al > M:
+        z_2d = z.new_zeros(M_al, N)
+        z_2d[:M] = z.view(M, N)
+    else:
+        z_2d = z.view(M, N)
+    y_last = N if inplace else N // 2
+    y_dtype = z.dtype if inplace else torch.uint8
+    y_2d = torch.empty(z_2d.size(0), y_last, dtype=y_dtype, device=z.device)
+    s_2d = z.new_empty(z_2d.size(0), N // block_size, dtype=torch.float32)
+    kernel = int4_quant_kernel(N, block_size, inplace=inplace)
+    kernel(z_2d, y_2d, s_2d)
+    if M_al > M:
+        y_2d = y_2d[:M]
+        s_2d = s_2d[:M]
+    if inplace:
+        x.copy_(y_2d.view_as(x))
+        return x
+    return y_2d.view(*z.shape[:-1], y_last), s_2d.view(*z.size()[:-1], N // block_size)
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def int4_gemm_kernel(N, K, out_dtype=BF16, accum_dtype=FP32, scale_dtype=FP32):
+    """FP8 act × INT4 weight GEMM kernel.
+
+    C[M, N] = A_fp8[M, K] @ B_int4[N, K]^T
+
+    Act: 1×128 quant on K, FP8 with configurable scale dtype
+    Weight: 1×32 symmetric INT4 quant on K, packed as uint8 (2 per byte), FP32 scale
+
+    B is stored as [N, K//2] in uint8.  Low nibble = even K, high nibble = odd K.
+    Strategy: load packed uint8 sub-blocks of [block_N, block_K//2],
+    unpack to signed int4 → cast to FP8, then do FP8×FP8 GEMM.
+    Apply act scale (per 128 on K) and weight scale (per 32 on K) to the accumulator.
+    """
+    M = T.symbolic("M")
+    act_group_size = 128
+    weight_group_size = 32
+    block_M = 32
+    block_N = 128
+    block_K = 32   # matches weight_group_size
+    n_sub = act_group_size // block_K  # 4
+
+    @T.prim_func
+    def int4_gemm_kernel_(
+        A: T.Tensor[(M, K), FP8],
+        B: T.Tensor[(N, K // 2), UINT8],
+        C: T.Tensor[(M, N), out_dtype],
+        scales_a: T.Tensor[(M, T.ceildiv(K, act_group_size)), scale_dtype],
+        scales_b: T.Tensor[(N, T.ceildiv(K, weight_group_size)), FP32],
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
+            bx, by,
+        ):
+            A_shared = T.alloc_shared((block_M, block_K), FP8)
+            B_packed_shared = T.alloc_shared((block_N, block_K // 2), UINT8)
+            B_shared = T.alloc_shared((block_N, block_K), FP8)
+            C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            C_local_accum = T.alloc_fragment((block_M, block_N), accum_dtype)
+            scale_a_frag = T.alloc_fragment((block_M,), FP32)
+            scale_b_frag = T.alloc_fragment((block_N,), FP32)
+
+            T.use_swizzle(panel_size=10)
+            T.clear(C_local)
+            T.clear(C_local_accum)
+
+            K_iters = T.ceildiv(K, block_K)
+            for k in T.Pipelined(K_iters, num_stages=2):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[bx * block_N, k * (block_K // 2)], B_packed_shared)
+
+                # Unpack uint8 → two signed int4 → cast to FP8
+                for i, j in T.Parallel(block_N, block_K):
+                    byte_idx = j // 2
+                    nibble = j % 2
+                    byte_val = T.Cast(INT32, B_packed_shared[i, byte_idx])
+                    val = T.if_then_else(nibble == 0, byte_val & 0x0F, (byte_val >> 4) & 0x0F)
+                    signed_val = T.if_then_else(val >= 8, val - 16, val)
+                    B_shared[i, j] = T.Cast(FP8, T.Cast(FP32, signed_val))
+
+                # Weight scale: per 32 on K, indexed by k
+                for i in T.Parallel(block_N):
+                    scale_b_frag[i] = scales_b[bx * block_N + i, k]
+
+                # Act scale: per 128 on K, indexed by k // n_sub
+                for i in T.Parallel(block_M):
+                    scale_a_frag[i] = T.Cast(FP32, scales_a[by * block_M + i, k // n_sub])
+
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+
+                for i, j in T.Parallel(block_M, block_N):
+                    C_local_accum[i, j] += C_local[i, j] * scale_a_frag[i] * scale_b_frag[j]
+                T.clear(C_local)
+
+            T.copy(C_local_accum, C_shared)
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return int4_gemm_kernel_
+
+
+def int4_gemm(
+    a: torch.Tensor, a_s: torch.Tensor, b: torch.Tensor, b_s: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """C[M,N] = A_fp8[M,K] @ B_int4[N,K]^T.
+    A has per-128 act scale; B is [N, K//2] in uint8 (packed signed INT4), with per-32 FP32 weight scale."""
+    assert a.is_contiguous() and b.is_contiguous()
+    assert a_s.is_contiguous() and b_s.is_contiguous()
+    tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    BLK_M = 32
+    M_al = ((M + BLK_M - 1) // BLK_M) * BLK_M
+    if M_al > M:
+        a_2d = a.new_zeros(M_al, K)
+        a_2d[:M] = a.view(M, K)
+        s_cols = a_s.numel() // M
+        a_s_2d = a_s.new_zeros(M_al, s_cols)
+        a_s_2d[:M] = a_s.view(M, s_cols)
+        c_2d = a.new_empty(M_al, N, dtype=torch.get_default_dtype())
+        kernel = int4_gemm_kernel(N, K, scale_dtype=tl_dtype)
+        kernel(a_2d, b, c_2d, a_s_2d, b_s)
+        return c_2d[:M].view(*a.size()[:-1], N)
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    kernel = int4_gemm_kernel(N, K, scale_dtype=tl_dtype)
+    kernel(a.view(M, K), b, c.view(M, N), a_s.view(M, -1), b_s)
+    return c
 
 
 def fp4_gemm(

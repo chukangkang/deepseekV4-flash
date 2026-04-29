@@ -14,6 +14,41 @@ FP4_TABLE = torch.tensor([
 ], dtype=torch.float32)
 
 
+def cast_e2m1fn_to_int4(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Converts FP4 (e2m1fn) + E8M0 scale weights to symmetric INT4 (uint8-packed) + FP32 scale.
+    Returns (weight_uint8[out, in//2], scale_fp32[out, in//32]).
+    """
+    assert x.dtype == torch.int8
+    assert x.ndim == 2
+    out_dim, packed_dim = x.size()
+    in_dim = packed_dim * 2
+    fp4_block_size = 32
+
+    # 1) Unpack FP4 nibbles → float via lookup table
+    xu = x.view(torch.uint8)
+    low  = xu & 0x0F
+    high = (xu >> 4) & 0x0F
+    vals = torch.stack([FP4_TABLE[low.long()], FP4_TABLE[high.long()]], dim=-1).flatten(1)  # [out, in]
+
+    # 2) Apply E8M0 per-32-element scale: 2^(exp-127)
+    scale_f = scale.float()                               # [out, in//32]
+    scale_exp = scale_f.repeat_interleave(fp4_block_size, dim=1)  # [out, in]
+    vals = vals * scale_exp                               # dequantized FP32
+
+    # 3) Group-wise symmetric INT4 quantisation (group_size=32)
+    vals_g = vals.view(out_dim, -1, fp4_block_size)       # [out, in//32, 32]
+    amax = vals_g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    int4_scale = (amax / 7.0).squeeze(-1)                 # [out, in//32]
+    int4_vals = torch.round(torch.clamp(vals_g / (amax / 7.0), -8, 7)).to(torch.int8)
+    int4_vals = int4_vals.view(out_dim, in_dim)
+
+    # 4) Pack two signed int4 into one uint8  (low nibble = even K, high = odd K)
+    u = int4_vals.to(torch.uint8) & 0x0F
+    packed = u[:, 0::2] | (u[:, 1::2] << 4)              # [out, in//2]
+    return packed, int4_scale.float()
+
+
 def cast_e2m1fn_to_e4m3fn(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Casts a tensor from e2m1fn to e4m3fn losslessly.
@@ -145,6 +180,11 @@ def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype):
                     weight = state_dicts[i].pop(name)
                     scale = state_dicts[i].pop(scale_name)
                     state_dicts[i][name], state_dicts[i][scale_name] = cast_e2m1fn_to_e4m3fn(weight, scale)
+                elif expert_dtype == "int4":
+                    scale_name = name.replace("weight", "scale")
+                    weight = state_dicts[i].pop(name)
+                    scale = state_dicts[i].pop(scale_name)
+                    state_dicts[i][name], state_dicts[i][scale_name] = cast_e2m1fn_to_int4(weight, scale)
                 else:
                     state_dicts[i][name] = state_dicts[i][name].view(torch.float4_e2m1fn_x2)
         save_file(state_dicts[i], os.path.join(save_path, f"model{i}-mp{mp}.safetensors"))
@@ -162,7 +202,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-path", type=str, required=True)
     parser.add_argument("--n-experts", type=int, required=True)
     parser.add_argument("--model-parallel", type=int, required=True)
-    parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4"], required=False, default=None)
+    parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4", "int4"], required=False, default=None)
     args = parser.parse_args()
     assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
     main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel, args.expert_dtype)

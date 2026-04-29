@@ -3,7 +3,7 @@
 # Usage: bash scripts/convert_fp8_16gpu.sh <hf_ckpt_path> <save_path>
 #
 # Non-expert weights: FP8 (float8_e4m3fn) — as stored in HF checkpoint
-# Expert weights:     FP4 (float4_e2m1fn)  — kept in native FP4 format
+# Expert weights:     INT4 (symmetric, uint8-packed) — converted from FP4
 # Shards all weights across 16 GPU ranks for 2-node x 8-GPU deployment.
 
 set -e
@@ -30,7 +30,7 @@ else
     source ${VENV_DIR}/bin/activate
 fi
 
-echo "Converting DeepSeek-V4 checkpoint (FP8 non-expert + FP4 expert)"
+echo "Converting DeepSeek-V4 checkpoint (FP8 non-expert + INT4 expert)"
 echo "  HF checkpoint: ${HF_CKPT_PATH}"
 echo "  Save path:     ${SAVE_PATH}"
 echo "  Experts:       ${EXPERTS}"
@@ -41,7 +41,8 @@ python ${PROJECT_DIR}/convert.py \
     --hf-ckpt-path ${HF_CKPT_PATH} \
     --save-path ${SAVE_PATH} \
     --n-experts ${EXPERTS} \
-    --model-parallel ${MP}
+    --model-parallel ${MP} \
+    --expert-dtype int4
 
 echo "Conversion complete. Output files:"
 ls -lh ${SAVE_PATH}/model*-mp${MP}.safetensors

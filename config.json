@@ -29,7 +29,9 @@
     "hc_sinkhorn_iters": 20,
     "dtype": "fp8",
     "scale_fmt": "ue8m0",
-    "expert_dtype": "fp4",
+    "expert_dtype": "int4",
+    "turbo_quant": true,
+    "turbo_quant_bits": 4,
     "compress_rope_theta": 160000,
     "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0]
 }
