@@ -1142,24 +1142,37 @@ class MoE(nn.Module):
             start = cumsum[self.experts_start_idx - 1].item() if self.experts_start_idx > 0 else 0
             # Pre-quantize activation once for w1/w3 (they share the same input x)
             sorted_x_q, sorted_x_s = act_quant(sorted_x, block_size, scale_fmt, scale_dtype)
+            # Multi-stream expert dispatch: overlap CPU launch with GPU execution
+            if not hasattr(self, '_expert_streams'):
+                self._expert_streams = [torch.cuda.Stream(device=x.device) for _ in range(4)]
+            expert_jobs = []  # (stream, sorted_tid_slice, out_future)
+            main_s = torch.cuda.current_stream()
+            si = 0
             for i, cnt in enumerate(counts_cpu):
                 if cnt == 0:
                     continue
                 eid = self.experts_start_idx + i
                 end = start + cnt
                 e = self.experts[eid]
-                xq, xs = sorted_x_q[start:end], sorted_x_s[start:end]
-                # Direct kernel calls — bypass Expert/Linear Module.__call__
-                gate = int4_gemm(xq, xs, e.w1.weight, e.w1.scale, scale_dtype).float()
-                up = int4_gemm(xq, xs, e.w3.weight, e.w3.scale, scale_dtype).float()
-                if e.swiglu_limit > 0:
-                    up = up.clamp(-e.swiglu_limit, e.swiglu_limit)
-                    gate = gate.clamp(max=e.swiglu_limit)
-                h = F.silu(gate) * up * sorted_w[start:end]
-                h_q, h_s = act_quant(h.to(sorted_x.dtype), block_size, scale_fmt, scale_dtype)
-                out = int4_gemm(h_q, h_s, e.w2.weight, e.w2.scale, scale_dtype)
-                y.index_add_(0, sorted_tid[start:end], out.float())
+                stream = self._expert_streams[si % len(self._expert_streams)]
+                si += 1
+                stream.wait_stream(main_s)
+                with torch.cuda.stream(stream):
+                    xq, xs = sorted_x_q[start:end], sorted_x_s[start:end]
+                    gate = int4_gemm(xq, xs, e.w1.weight, e.w1.scale, scale_dtype).float()
+                    up = int4_gemm(xq, xs, e.w3.weight, e.w3.scale, scale_dtype).float()
+                    if e.swiglu_limit > 0:
+                        up = up.clamp(-e.swiglu_limit, e.swiglu_limit)
+                        gate = gate.clamp(max=e.swiglu_limit)
+                    h = F.silu(gate) * up * sorted_w[start:end]
+                    h_q, h_s = act_quant(h.to(sorted_x.dtype), block_size, scale_fmt, scale_dtype)
+                    out = int4_gemm(h_q, h_s, e.w2.weight, e.w2.scale, scale_dtype)
+                expert_jobs.append((stream, sorted_tid[start:end], out))
                 start = end
+            # Sync all expert streams and scatter results back
+            for stream, tid_slice, out in expert_jobs:
+                main_s.wait_stream(stream)
+                y.index_add_(0, tid_slice, out.float())
         if world_size > 1:
             dist.all_reduce(y, group=tp_group)
         # Wait for shared expert to finish then add
