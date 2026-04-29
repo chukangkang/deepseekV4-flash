@@ -326,7 +326,11 @@ class BatchedOpenAIServer:
                 pending.handle.set_error(exc)
         if not prepared:
             return
-        for subbatch in self._split_prepared_batches(prepared):
+        subbatches = self._split_prepared_batches(prepared)
+        dropped = len(batch) - len(live_batch)
+        if dropped > 0 or len(subbatches) > 1:
+            _log(f"batch={len(batch)} → live={len(live_batch)} (dropped={dropped}), split into {len(subbatches)} sub-batches of sizes {[len(sb) for sb in subbatches]}")
+        for subbatch in subbatches:
             stream_ctxs: List[Optional[StreamContext]] = []
             for item in subbatch:
                 if item.pending.handle.streaming:
@@ -737,14 +741,14 @@ def main():
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--model-name", type=str, default="deepseek-v4-flash")
-    parser.add_argument("--max-batch-size", type=int, default=64)
+    parser.add_argument("--max-batch-size", type=int, default=16)
     parser.add_argument("--batch-timeout-ms", type=int, default=5000)
     parser.add_argument("--prefill-chunk-size", type=int, default=512)
     parser.add_argument("--max-batch-total-tokens", type=int, default=0)
     parser.add_argument("--release-kv-after-batch", action="store_true")
     parser.add_argument("--max-queue-size", type=int, default=1024)
     parser.add_argument("--max-seq-len", type=int, default=0)
-    parser.add_argument("--request-timeout-s", type=int, default=120, help="Drop queued requests older than this (seconds)")
+    parser.add_argument("--request-timeout-s", type=int, default=600, help="Drop queued requests older than this (seconds)")
     args = parser.parse_args()
 
     model, tokenizer, model_args, ctrl_group, global_rank, pp_rank, pp_peer_rank = init_runtime(
