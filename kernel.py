@@ -112,17 +112,28 @@ def act_quant(
     assert N % block_size == 0
     tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
     z = x.contiguous()
-    y = torch.empty_like(z) if inplace else torch.empty_like(z, dtype=torch.float8_e4m3fn)
-    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=scale_dtype)
+    M = z.numel() // N
+    BLK_M = 32
+    M_al = ((M + BLK_M - 1) // BLK_M) * BLK_M
+    if M_al > M:
+        z_2d = z.new_zeros(M_al, N)
+        z_2d[:M] = z.view(M, N)
+    else:
+        z_2d = z.view(M, N)
+    y_2d = torch.empty_like(z_2d) if inplace else torch.empty(z_2d.size(0), N, dtype=torch.float8_e4m3fn, device=z.device)
+    s_2d = z.new_empty(z_2d.size(0), N // block_size, dtype=scale_dtype)
     kernel = act_quant_kernel(
         N, block_size, scale_dtype=tl_dtype,
         round_scale=scale_fmt is not None, inplace=inplace,
     )
-    kernel(z.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
+    kernel(z_2d, y_2d, s_2d)
+    if M_al > M:
+        y_2d = y_2d[:M]
+        s_2d = s_2d[:M]
     if inplace:
-        x.copy_(y)
+        x.copy_(y_2d.view_as(x))
         return x
-    return y, s
+    return y_2d.view_as(z), s_2d.view(*z.size()[:-1], N // block_size)
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -190,14 +201,27 @@ def fp4_act_quant(
     N = x.size(-1)
     assert N % block_size == 0
     z = x.contiguous()
-    y = torch.empty_like(z) if inplace else z.new_empty(*z.shape[:-1], N // 2, dtype=torch.float4_e2m1fn_x2)
-    s = z.new_empty(*z.size()[:-1], N // block_size, dtype=torch.float8_e8m0fnu)
+    M = z.numel() // N
+    BLK_M = 32
+    M_al = ((M + BLK_M - 1) // BLK_M) * BLK_M
+    if M_al > M:
+        z_2d = z.new_zeros(M_al, N)
+        z_2d[:M] = z.view(M, N)
+    else:
+        z_2d = z.view(M, N)
+    y_last = N if inplace else N // 2
+    y_dtype = z.dtype if inplace else torch.float4_e2m1fn_x2
+    y_2d = torch.empty(z_2d.size(0), y_last, dtype=y_dtype, device=z.device)
+    s_2d = z.new_empty(z_2d.size(0), N // block_size, dtype=torch.float8_e8m0fnu)
     kernel = fp4_quant_kernel(N, block_size, inplace=inplace)
-    kernel(z.view(-1, N), y.view(-1, y.size(-1)), s.view(-1, N // block_size))
+    kernel(z_2d, y_2d, s_2d)
+    if M_al > M:
+        y_2d = y_2d[:M]
+        s_2d = s_2d[:M]
     if inplace:
-        x.copy_(y)
+        x.copy_(y_2d.view_as(x))
         return x
-    return y, s
+    return y_2d.view(*z.shape[:-1], y_last), s_2d.view(*z.size()[:-1], N // block_size)
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -267,6 +291,18 @@ def fp8_gemm(
     K = a.size(-1)
     M = a.numel() // K
     N = b.size(0)
+    BLK_M = 32
+    M_al = ((M + BLK_M - 1) // BLK_M) * BLK_M
+    if M_al > M:
+        a_2d = a.new_zeros(M_al, K)
+        a_2d[:M] = a.view(M, K)
+        s_cols = a_s.numel() // M
+        a_s_2d = a_s.new_zeros(M_al, s_cols)
+        a_s_2d[:M] = a_s.view(M, s_cols)
+        c_2d = a.new_empty(M_al, N, dtype=torch.get_default_dtype())
+        kernel = fp8_gemm_kernel(N, K, scale_dtype=tl_dtype)
+        kernel(a_2d, b, c_2d, a_s_2d, b_s)
+        return c_2d[:M].view(*a.size()[:-1], N)
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
     kernel = fp8_gemm_kernel(N, K, scale_dtype=tl_dtype)
     kernel(a.view(M, K), b, c.view(M, N), a_s.view(M, -1), b_s)
@@ -530,6 +566,18 @@ def fp4_gemm(
     K = a.size(-1)
     M = a.numel() // K
     N = b.size(0)
+    BLK_M = 32
+    M_al = ((M + BLK_M - 1) // BLK_M) * BLK_M
+    if M_al > M:
+        a_2d = a.new_zeros(M_al, K)
+        a_2d[:M] = a.view(M, K)
+        s_cols = a_s.numel() // M
+        a_s_2d = a_s.new_zeros(M_al, s_cols)
+        a_s_2d[:M] = a_s.view(M, s_cols)
+        c_2d = a.new_empty(M_al, N, dtype=torch.get_default_dtype())
+        kernel = fp4_gemm_kernel(N, K, scale_dtype=tl_dtype)
+        kernel(a_2d, b, c_2d, a_s_2d, b_s)
+        return c_2d[:M].view(*a.size()[:-1], N)
     c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
     kernel = fp4_gemm_kernel(N, K, scale_dtype=tl_dtype)
     kernel(a.view(M, K), b, c.view(M, N), a_s.view(M, -1), b_s)
