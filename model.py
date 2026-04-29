@@ -1126,13 +1126,29 @@ class MoE(nn.Module):
                     if self.experts_start_idx <= eid < self.experts_end_idx:
                         y[row] += self.experts[eid](x[row:row+1], weights[row:row+1, col:col+1]).squeeze(0)
         else:
-            counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-            for i in range(self.experts_start_idx, self.experts_end_idx):
-                if counts[i] == 0:
+            # Sort-based dispatch: one sort instead of 32 torch.where calls
+            flat_indices = indices.flatten()  # [n_tokens * topk]
+            flat_weights = weights.flatten().unsqueeze(1)  # [n_tokens * topk, 1]
+            token_ids = torch.arange(n_tokens, device=x.device).unsqueeze(1).expand_as(indices).flatten()
+            order = flat_indices.argsort()
+            sorted_eid = flat_indices[order]
+            sorted_tid = token_ids[order]
+            sorted_w = flat_weights[order]
+            sorted_x = x[sorted_tid]
+            # Compute expert boundaries using a single bincount
+            counts = torch.bincount(sorted_eid, minlength=self.n_routed_experts)
+            cumsum = counts.cumsum(0)
+            counts_cpu = counts[self.experts_start_idx:self.experts_end_idx].tolist()
+            start = cumsum[self.experts_start_idx - 1].item() if self.experts_start_idx > 0 else 0
+            for i, cnt in enumerate(counts_cpu):
+                if cnt == 0:
+                    start += cnt
                     continue
-                expert = self.experts[i]
-                idx, top = torch.where(indices == i)
-                y[idx] += expert(x[idx], weights[idx, top, None])
+                eid = self.experts_start_idx + i
+                end = start + cnt
+                expert_out = self.experts[eid](sorted_x[start:end], sorted_w[start:end])
+                y.index_add_(0, sorted_tid[start:end], expert_out.float())
+                start = end
         if world_size > 1:
             dist.all_reduce(y, group=tp_group)
         # Wait for shared expert to finish then add
