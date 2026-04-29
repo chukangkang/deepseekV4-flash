@@ -481,6 +481,7 @@ class BatchedOpenAIServer:
     def _distributed_generate(self, payload: Dict[str, Any],
                                stream_ctxs: Optional[List[Optional[StreamContext]]] = None) -> List[Dict[str, Any]]:
         self.model.reset_caches(release=False)
+        _gen_start = time.perf_counter()
         prompt_tokens: List[List[int]] = payload["prompt_tokens"]
         temperatures: List[float] = payload["temperatures"]
         top_ps: List[float] = payload["top_ps"]
@@ -600,20 +601,29 @@ class BatchedOpenAIServer:
                                 sctx.prev_text = new_text
                     if finished.all():
                         break
-                    # V2: early break when items finish + pending requests exist
-                    if bsz > 1 and finished.any():
+                    # V2: early break when enough items finish + pending requests exist
+                    # Only break when re-prefill cost is justified:
+                    #   - at least half the batch is done (avoids breaking for 1/19)
+                    #   - re-prefill cost (n_unfinished * cur_pos) < 2x remaining decode work
+                    if bsz > 1:
                         decode_step = cur_pos - shared_prefill + 1
-                        if decode_step > 0 and decode_step % 32 == 0:
-                            should_break = [False]
-                            if self.global_rank == 0:
-                                with self.cv:
-                                    should_break[0] = len(self.pending) > 0
-                            dist.broadcast_object_list(should_break, src=0, group=self.ctrl_group)
-                            if should_break[0]:
-                                n_done = finished.sum().item()
-                                if self.global_rank == 0:
-                                    _log(f"V2 early break at pos {cur_pos}: {n_done}/{bsz} done, pending requests waiting")
-                                break
+                        if decode_step > 0 and decode_step % 64 == 0:
+                            n_finished_v2 = finished.sum().item()
+                            if n_finished_v2 >= max(bsz // 2, 2):
+                                n_unfinished = bsz - n_finished_v2
+                                reprefill_cost = n_unfinished * cur_pos
+                                remaining_decode = n_unfinished * max(total_len - cur_pos, 1)
+                                if reprefill_cost <= remaining_decode * 2:
+                                    should_break = [False]
+                                    if self.global_rank == 0:
+                                        with self.cv:
+                                            should_break[0] = len(self.pending) > 0
+                                    dist.broadcast_object_list(should_break, src=0, group=self.ctrl_group)
+                                    if should_break[0]:
+                                        if self.global_rank == 0:
+                                            _log(f"V2 early break at pos {cur_pos}: {n_finished_v2}/{bsz} done, "
+                                                 f"reprefill={reprefill_cost} vs remaining={remaining_decode}")
+                                        break
                 prev_pos = cur_pos
             # Log step timing diagnostics
             if _step_times and self.global_rank == 0:
@@ -637,7 +647,8 @@ class BatchedOpenAIServer:
                 if self.tokenizer.eos_token_id in piece:
                     piece = piece[:piece.index(self.tokenizer.eos_token_id)]
                 piece.append(self.tokenizer.eos_token_id)
-                outputs.append({"completion_tokens": piece, "prompt_tokens": prompt_lens[i]})
+                gen_time = time.perf_counter() - _gen_start
+                outputs.append({"completion_tokens": piece, "prompt_tokens": prompt_lens[i], "generation_time_s": gen_time})
                 if early_break and not finished[i]:
                     # Collect full token history for continuation
                     history = [t for t in full_tokens if t != -1]
@@ -667,10 +678,14 @@ class BatchedOpenAIServer:
     def _finalize_stream(self, prepared: PreparedRequest, output: Dict[str, Any], sctx: StreamContext):
         """Send the finish signal to a streaming handle after generation completes."""
         completion_token_count = len(sctx.gen_tokens)
+        gen_time = output.get("generation_time_s", 0)
+        gen_tps = completion_token_count / max(gen_time, 0.001) if completion_token_count > 0 else 0
         usage = {
             "prompt_tokens": output["prompt_tokens"],
             "completion_tokens": completion_token_count,
             "total_tokens": output["prompt_tokens"] + completion_token_count,
+            "generation_time_s": round(gen_time, 3),
+            "tokens_per_second": round(gen_tps, 1),
         }
         sctx.handle.push_finish("stop", usage)
 
@@ -690,6 +705,8 @@ class BatchedOpenAIServer:
             message["tool_calls"] = parsed["tool_calls"]
             finish_reason = "tool_calls"
         completion_token_count = len(self.tokenizer.encode(content, add_special_tokens=False))
+        gen_time = output.get("generation_time_s", 0)
+        gen_tps = completion_token_count / max(gen_time, 0.001) if completion_token_count > 0 else 0
         return {
             "id": prepared.pending.request_id,
             "object": "chat.completion",
@@ -706,6 +723,8 @@ class BatchedOpenAIServer:
                 "prompt_tokens": output["prompt_tokens"],
                 "completion_tokens": completion_token_count,
                 "total_tokens": output["prompt_tokens"] + completion_token_count,
+                "generation_time_s": round(gen_time, 3),
+                "tokens_per_second": round(gen_tps, 1),
             },
         }
 
