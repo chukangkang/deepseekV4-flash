@@ -1124,7 +1124,7 @@ class MoE(nn.Module):
             for row in range(n_tokens):
                 for col, eid in enumerate(indices_list[row]):
                     if self.experts_start_idx <= eid < self.experts_end_idx:
-                        y[row] += self.experts[eid](x[row:row+1], weights[row:row+1, col:col+1])
+                        y[row] += self.experts[eid](x[row:row+1], weights[row:row+1, col:col+1]).squeeze(0)
         else:
             counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
             for i in range(self.experts_start_idx, self.experts_end_idx):
