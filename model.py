@@ -957,6 +957,15 @@ class MoE(nn.Module):
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)
+        # MiniMax-style overlap: launch shared expert on a separate CUDA stream
+        # so it runs in parallel with routed experts + all_reduce
+        main_stream = torch.cuda.current_stream()
+        if not hasattr(self, '_shared_stream'):
+            self._shared_stream = torch.cuda.Stream(device=x.device)
+        self._shared_stream.wait_stream(main_stream)
+        with torch.cuda.stream(self._shared_stream):
+            shared_out = self.shared_experts(x)
+        # Routed experts on main stream
         n_tokens = x.size(0)
         if n_tokens <= 2:
             # Fast path for single/few-token decode: directly iterate activated experts
@@ -976,7 +985,9 @@ class MoE(nn.Module):
                 y[idx] += expert(x[idx], weights[idx, top, None])
         if world_size > 1:
             dist.all_reduce(y, group=tp_group)
-        y += self.shared_experts(x)
+        # Wait for shared expert to finish then add
+        main_stream.wait_stream(self._shared_stream)
+        y += shared_out
         return y.type_as(x).view(shape)
 
 
