@@ -330,10 +330,16 @@ class BatchedOpenAIServer:
         dropped = len(batch) - len(live_batch)
         if dropped > 0 or len(subbatches) > 1:
             _log(f"batch={len(batch)} → live={len(live_batch)} (dropped={dropped}), split into {len(subbatches)} sub-batches of sizes {[len(sb) for sb in subbatches]}")
-        for subbatch in subbatches:
+        pending_subbatches = list(subbatches)
+        while pending_subbatches:
+            subbatch = pending_subbatches.pop(0)
             stream_ctxs: List[Optional[StreamContext]] = []
             for item in subbatch:
-                if item.pending.handle.streaming:
+                # Check for carried-forward stream context from V2 continuation
+                cont_sctx = self._cont_stream_ctxs.pop(id(item), None) if hasattr(self, '_cont_stream_ctxs') else None
+                if cont_sctx is not None:
+                    stream_ctxs.append(cont_sctx)
+                elif item.pending.handle.streaming:
                     stream_ctxs.append(StreamContext(
                         handle=item.pending.handle,
                         request_id=item.pending.request_id,
@@ -353,18 +359,79 @@ class BatchedOpenAIServer:
             try:
                 _log(f"broadcasting sub-batch of {len(subbatch)} requests, prompt_lens={[len(item.prompt_tokens) for item in subbatch]}")
                 t0 = time.time()
-                outputs = self._broadcast_and_generate(payload, stream_ctxs)
+                outputs, continuations = self._broadcast_and_generate(payload, stream_ctxs)
                 elapsed = time.time() - t0
                 total_gen = sum(len(o['completion_tokens']) for o in outputs)
                 _log(f"sub-batch done in {elapsed:.1f}s, total_gen_tokens={total_gen}, tok/s={total_gen/max(elapsed,0.001):.1f}")
-                for item, output, sctx in zip(subbatch, outputs, stream_ctxs):
+                # Build set of unfinished indices for continuation
+                cont_indices = {c["index"] for c in continuations}
+                for i, (item, output, sctx) in enumerate(zip(subbatch, outputs, stream_ctxs)):
+                    if i in cont_indices:
+                        continue  # handled below as continuation
                     if sctx is not None:
                         self._finalize_stream(item, output, sctx)
                     else:
                         item.pending.handle.set_result(self._build_response(item, output))
+                # V2: merge unfinished items back as new sub-batches
+                if continuations:
+                    cont_prepared: List[PreparedRequest] = []
+                    cont_stream_ctxs: List[Optional[StreamContext]] = []
+                    for c in continuations:
+                        idx = c["index"]
+                        orig = subbatch[idx]
+                        # Create continuation PreparedRequest with full token history
+                        cont_req = PreparedRequest(
+                            pending=orig.pending,
+                            messages=orig.messages,
+                            prompt_tokens=c["full_tokens"],
+                            prompt_key=orig.prompt_key,
+                            temperature=orig.temperature,
+                            top_p=orig.top_p,
+                            max_new_tokens=c["remaining_max_tokens"],
+                            stop=orig.stop,
+                        )
+                        cont_prepared.append(cont_req)
+                        # Carry forward stream context (update prompt_len to skip re-prefilled tokens)
+                        orig_sctx = stream_ctxs[idx]
+                        if orig_sctx is not None:
+                            orig_sctx.prompt_len = len(c["full_tokens"])
+                        cont_stream_ctxs.append(orig_sctx)
+                    _log(f"V2 continuation: {len(cont_prepared)} unfinished items re-queued")
+                    # These will be merged with new pending below
+                    cont_subs = self._split_prepared_batches(cont_prepared)
+                    # Prepend continuations so they run before new requests
+                    # Attach their stream_ctxs via a side-channel
+                    for csub in cont_subs:
+                        pending_subbatches.insert(0, csub)
+                    # Store continuation stream contexts for next iteration
+                    if not hasattr(self, '_cont_stream_ctxs'):
+                        self._cont_stream_ctxs = {}
+                    for cp, cs in zip(cont_prepared, cont_stream_ctxs):
+                        self._cont_stream_ctxs[id(cp)] = cs
             except Exception as exc:
                 for item in subbatch:
                     item.pending.handle.set_error(exc)
+            # V1 Continuous Batching: after each sub-batch, eagerly pull new pending requests
+            new_pending: List[PendingRequest] = []
+            with self.cv:
+                now = int(time.time())
+                while self.pending:
+                    p = self.pending.pop(0)
+                    if now - p.created > self.request_timeout_s:
+                        p.handle.set_error(TimeoutError(f"request waited {now - p.created}s in queue, dropped"))
+                    else:
+                        new_pending.append(p)
+            if new_pending:
+                new_prepared: List[PreparedRequest] = []
+                for p in new_pending:
+                    try:
+                        new_prepared.append(self._prepare_request(p))
+                    except Exception as exc:
+                        p.handle.set_error(exc)
+                if new_prepared:
+                    new_subs = self._split_prepared_batches(new_prepared)
+                    _log(f"continuous batching: pulled {len(new_pending)} new requests → {len(new_subs)} sub-batches")
+                    pending_subbatches.extend(new_subs)
 
     def _split_prepared_batches(self, prepared: List[PreparedRequest]) -> List[List[PreparedRequest]]:
         if len(prepared) <= 1:
@@ -388,7 +455,7 @@ class BatchedOpenAIServer:
         return batches
 
     def _broadcast_and_generate(self, payload: Dict[str, Any],
-                                 stream_ctxs: Optional[List[Optional[StreamContext]]] = None) -> List[Dict[str, Any]]:
+                                 stream_ctxs: Optional[List[Optional[StreamContext]]] = None):
         payloads = [payload]
         dist.broadcast_object_list(payloads, src=0, group=self.ctrl_group)
         return self._distributed_generate(payload, stream_ctxs)
@@ -479,6 +546,7 @@ class BatchedOpenAIServer:
                     tokens[0, cur_pos] = next_token[0]
                     tok_val = next_token[0].item()
                     if tok_val == eos_id or cur_pos + 1 >= _gen_end_val:
+                        finished[0] = True
                         # Push final streaming token before break
                         if stream_ctxs is not None:
                             sctx = stream_ctxs[0]
@@ -529,10 +597,27 @@ class BatchedOpenAIServer:
                                 sctx.prev_text = new_text
                     if finished.all():
                         break
+                    # V2: early break when items finish + pending requests exist
+                    if bsz > 1 and finished.any():
+                        decode_step = cur_pos - shared_prefill + 1
+                        if decode_step > 0 and decode_step % 32 == 0:
+                            should_break = [False]
+                            if self.global_rank == 0:
+                                with self.cv:
+                                    should_break[0] = len(self.pending) > 0
+                            dist.broadcast_object_list(should_break, src=0, group=self.ctrl_group)
+                            if should_break[0]:
+                                n_done = finished.sum().item()
+                                if self.global_rank == 0:
+                                    _log(f"V2 early break at pos {cur_pos}: {n_done}/{bsz} done, pending requests waiting")
+                                break
                 prev_pos = cur_pos
+            # Build outputs + continuation info for unfinished items
+            early_break = not finished.all()
             outputs: List[Dict[str, Any]] = []
-            completion_tokens = tokens.tolist()
-            for i, full_tokens in enumerate(completion_tokens):
+            continuations: List[Dict[str, Any]] = []
+            completion_tokens_list = tokens.tolist()
+            for i, full_tokens in enumerate(completion_tokens_list):
                 start = prompt_lens[i]
                 end = min(len(full_tokens), prompt_lens[i] + max_new_tokens[i])
                 piece = full_tokens[start:end]
@@ -540,7 +625,16 @@ class BatchedOpenAIServer:
                     piece = piece[:piece.index(self.tokenizer.eos_token_id)]
                 piece.append(self.tokenizer.eos_token_id)
                 outputs.append({"completion_tokens": piece, "prompt_tokens": prompt_lens[i]})
-            return outputs
+                if early_break and not finished[i]:
+                    # Collect full token history for continuation
+                    history = [t for t in full_tokens if t != -1]
+                    remaining = max_new_tokens[i] - (len(history) - prompt_lens[i])
+                    continuations.append({
+                        "index": i,
+                        "full_tokens": history,
+                        "remaining_max_tokens": max(1, remaining),
+                    })
+            return outputs, continuations
         finally:
             self.model.reset_caches(release=self.release_kv_after_batch)
 
