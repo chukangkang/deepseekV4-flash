@@ -426,6 +426,13 @@ class BatchedOpenAIServer:
             prompt_mask = tokens != -1
             finished = torch.zeros(bsz, dtype=torch.bool, device="cuda")
             generation_ends = torch.tensor([min(total_len, p + m) for p, m in zip(prompt_lens, max_new_tokens)], dtype=torch.long, device="cuda")
+            # Pre-allocate reusable tensors for the decode loop
+            forced_eos = torch.full((bsz,), self.tokenizer.eos_token_id, dtype=torch.long, device="cuda")
+            eos_id = self.tokenizer.eos_token_id
+            max_prompt_len = max(prompt_lens)
+            # Pre-allocate PP communication buffers for decode (seqlen=1)
+            _pp_h_buf = torch.empty(bsz, 1, self.hc_mult, self.dim, dtype=torch.bfloat16, device="cuda") if self.pp_rank != 0 else None
+            _pp_tok_buf = torch.empty(bsz, dtype=torch.long, device="cuda") if self.pp_rank == 0 else None
             prev_pos = 0
             shared_prefill = min(prompt_lens)
             logits = None
@@ -443,6 +450,9 @@ class BatchedOpenAIServer:
                     self.vocab_size,
                 )
                 prev_pos = cur_pos
+            # Decode loop — optimized for the common bsz==1 pure-decode case
+            _pure_decode = (bsz == 1 and shared_prefill == max_prompt_len)
+            _gen_end_val = generation_ends[0].item() if _pure_decode else 0
             for cur_pos in range(shared_prefill, total_len):
                 input_ids = tokens[:, prev_pos:cur_pos]
                 next_token = pp_next_token(
@@ -457,35 +467,65 @@ class BatchedOpenAIServer:
                     temperatures,
                     top_ps,
                     33377335 + cur_pos,
+                    h_buf=_pp_h_buf,
+                    tok_buf=_pp_tok_buf,
                 )
-                next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
-                active = cur_pos < generation_ends
-                forced_eos = torch.full_like(next_token, self.tokenizer.eos_token_id)
-                next_token = torch.where(prompt_mask[:, cur_pos] | active, next_token, forced_eos)
-                tokens[:, cur_pos] = next_token
-                finished |= ((~prompt_mask[:, cur_pos]) & (next_token == self.tokenizer.eos_token_id)) | (cur_pos + 1 >= generation_ends)
+                if _pure_decode:
+                    # Fast path: bsz=1, all positions are decode — skip prompt_mask checks
+                    tokens[0, cur_pos] = next_token[0]
+                    tok_val = next_token[0].item()
+                    if tok_val == eos_id or cur_pos + 1 >= _gen_end_val:
+                        # Push final streaming token before break
+                        if stream_ctxs is not None:
+                            sctx = stream_ctxs[0]
+                            if sctx is not None and not sctx.finished:
+                                if tok_val == eos_id:
+                                    sctx.finished = True
+                                else:
+                                    sctx.gen_tokens.append(tok_val)
+                                    new_text = self.tokenizer.decode(sctx.gen_tokens, skip_special_tokens=True)
+                                    delta = new_text[len(sctx.prev_text):]
+                                    if delta:
+                                        sctx.handle.push_token(delta)
+                                        sctx.prev_text = new_text
+                        prev_pos = cur_pos
+                        break
+                    if stream_ctxs is not None:
+                        sctx = stream_ctxs[0]
+                        if sctx is not None and not sctx.finished:
+                            sctx.gen_tokens.append(tok_val)
+                            new_text = self.tokenizer.decode(sctx.gen_tokens, skip_special_tokens=True)
+                            delta = new_text[len(sctx.prev_text):]
+                            if delta:
+                                sctx.handle.push_token(delta)
+                                sctx.prev_text = new_text
+                else:
+                    # General batched path
+                    next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
+                    active = cur_pos < generation_ends
+                    next_token = torch.where(prompt_mask[:, cur_pos] | active, next_token, forced_eos)
+                    tokens[:, cur_pos] = next_token
+                    finished |= ((~prompt_mask[:, cur_pos]) & (next_token == eos_id)) | (cur_pos + 1 >= generation_ends)
+                    if stream_ctxs is not None:
+                        next_token_list = next_token.tolist()
+                        for i, sctx in enumerate(stream_ctxs):
+                            if sctx is None or sctx.finished:
+                                continue
+                            if cur_pos < prompt_lens[i]:
+                                continue
+                            tok_id = next_token_list[i]
+                            if tok_id == eos_id:
+                                sctx.finished = True
+                                continue
+                            sctx.gen_tokens.append(tok_id)
+                            new_text = self.tokenizer.decode(sctx.gen_tokens, skip_special_tokens=True)
+                            delta = new_text[len(sctx.prev_text):]
+                            if delta:
+                                sctx.handle.push_token(delta)
+                                sctx.prev_text = new_text
+                    if finished.all():
+                        break
                 prev_pos = cur_pos
-                # Push incremental tokens to streaming handles
-                if stream_ctxs is not None:
-                    next_token_list = next_token.tolist()
-                    for i, sctx in enumerate(stream_ctxs):
-                        if sctx is None or sctx.finished:
-                            continue
-                        is_prompt = prompt_mask[i, cur_pos].item()
-                        if is_prompt:
-                            continue
-                        tok_id = next_token_list[i]
-                        if tok_id == self.tokenizer.eos_token_id:
-                            sctx.finished = True
-                            continue
-                        sctx.gen_tokens.append(tok_id)
-                        new_text = self.tokenizer.decode(sctx.gen_tokens, skip_special_tokens=True)
-                        delta = new_text[len(sctx.prev_text):]
-                        if delta:
-                            sctx.handle.push_token(delta)
-                            sctx.prev_text = new_text
-                if finished.all():
-                    break
             outputs: List[Dict[str, Any]] = []
             completion_tokens = tokens.tolist()
             for i, full_tokens in enumerate(completion_tokens):

@@ -957,13 +957,23 @@ class MoE(nn.Module):
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
         y = torch.zeros_like(x, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
-        for i in range(self.experts_start_idx, self.experts_end_idx):
-            if counts[i] == 0:
-                continue
-            expert = self.experts[i]
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(x[idx], weights[idx, top, None])
+        n_tokens = x.size(0)
+        if n_tokens <= 2:
+            # Fast path for single/few-token decode: directly iterate activated experts
+            # Avoids bincount (CUDA sync) + 32 torch.where kernel launches per layer
+            indices_list = indices.tolist()
+            for row in range(n_tokens):
+                for col, eid in enumerate(indices_list[row]):
+                    if self.experts_start_idx <= eid < self.experts_end_idx:
+                        y[row] += self.experts[eid](x[row:row+1], weights[row:row+1, col:col+1])
+        else:
+            counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
+            for i in range(self.experts_start_idx, self.experts_end_idx):
+                if counts[i] == 0:
+                    continue
+                expert = self.experts[i]
+                idx, top = torch.where(indices == i)
+                y[idx] += expert(x[idx], weights[idx, top, None])
         if world_size > 1:
             dist.all_reduce(y, group=tp_group)
         y += self.shared_experts(x)

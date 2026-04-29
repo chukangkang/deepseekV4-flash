@@ -136,15 +136,21 @@ def pp_forward(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim,
 
 
 def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
-                  temperatures, top_ps, seed: int):
+                  temperatures, top_ps, seed: int, h_buf=None, tok_buf=None):
     bsz, seqlen = input_ids.size()
     if pp_rank == 0:
         h = model.forward(input_ids, start_pos)
         dist.send(h.contiguous(), dst=pp_peer_rank)
-        next_token = torch.empty(bsz, dtype=torch.long, device="cuda")
+        if tok_buf is not None and tok_buf.shape[0] >= bsz:
+            next_token = tok_buf[:bsz]
+        else:
+            next_token = torch.empty(bsz, dtype=torch.long, device="cuda")
         dist.recv(next_token, src=pp_peer_rank)
         return next_token
-    h = torch.empty(bsz, seqlen, hc_mult, dim, dtype=torch.bfloat16, device="cuda")
+    if h_buf is not None and h_buf.shape[0] >= bsz and h_buf.shape[1] >= seqlen:
+        h = h_buf[:bsz, :seqlen]
+    else:
+        h = torch.empty(bsz, seqlen, hc_mult, dim, dtype=torch.bfloat16, device="cuda")
     dist.recv(h, src=pp_peer_rank)
     logits = model.forward(input_ids, start_pos, hidden_states=h)
     next_token = sample_batch(logits, temperatures, top_ps, seed)
