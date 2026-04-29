@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 from functools import lru_cache
@@ -809,17 +810,29 @@ class Block(nn.Module):
         return y.type_as(x)
 
     def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+        _dbg = os.environ.get("DEBUG_SYNC")
+        def _sync(tag):
+            if _dbg:
+                torch.cuda.synchronize()
+                print(f"[Block {self.layer_id}] {tag} ok", flush=True)
+        _sync("enter")
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        _sync("hc_pre_attn")
         x = self.attn_norm(x)
         x = self.attn(x, start_pos)
+        _sync("attn")
         x = self.hc_post(x, residual, post, comb)
+        _sync("hc_post_attn")
 
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        _sync("hc_pre_ffn")
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
+        _sync("ffn")
         x = self.hc_post(x, residual, post, comb)
+        _sync("hc_post_ffn")
         return x
 
 
@@ -972,17 +985,27 @@ class Transformer(nn.Module):
 
     @torch.inference_mode()
     def forward(self, input_ids: torch.Tensor, start_pos: int = 0, hidden_states: torch.Tensor = None):
+        _dbg = os.environ.get("DEBUG_SYNC")
         if self.embed is not None:
             h = self.embed(input_ids)
             # Expand to hc_mult copies for Hyper-Connections
             h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+            if _dbg:
+                torch.cuda.synchronize()
+                print(f"[Transformer] embed ok, h {h.shape}", flush=True)
         else:
             assert hidden_states is not None, "Stage > 0 requires hidden_states input"
             h = hidden_states
         for layer in self.layers:
             h = layer(h, start_pos, input_ids)
         if self.head is not None:
+            if _dbg:
+                torch.cuda.synchronize()
+                print(f"[Transformer] all layers done, running head", flush=True)
             logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+            if _dbg:
+                torch.cuda.synchronize()
+                print(f"[Transformer] head ok", flush=True)
             return logits
         return h
 
