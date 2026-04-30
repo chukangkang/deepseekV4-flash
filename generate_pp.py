@@ -141,12 +141,13 @@ _pp_prof_wait_total = 0.0
 _pp_prof_fwd_window = 0.0
 _pp_prof_wait_window = 0.0
 _PP_PROF_INTERVAL = 50
+_PP_PROF_ENABLED = os.environ.get("PP_PROFILE", "0") == "1"
 
 def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
                   temperatures, top_ps, seed: int, h_buf=None, tok_buf=None):
     global _pp_prof_steps, _pp_prof_fwd_total, _pp_prof_wait_total, _pp_prof_fwd_window, _pp_prof_wait_window
     bsz, seqlen = input_ids.size()
-    _do_profile = seqlen == 1  # only profile decode steps
+    _do_profile = _PP_PROF_ENABLED and seqlen == 1  # only profile decode steps
     if pp_rank == 0:
         if _do_profile:
             torch.cuda.synchronize()
