@@ -895,7 +895,7 @@ def main():
     parser.add_argument("--release-kv-after-batch", action="store_true")
     parser.add_argument("--max-queue-size", type=int, default=1024)
     parser.add_argument("--max-seq-len", type=int, default=0)
-    parser.add_argument("--request-timeout-s", type=int, default=600, help="Drop queued requests older than this (seconds)")
+    parser.add_argument("--request-timeout-s", type=int, default=3600, help="Drop queued requests older than this (seconds)")
     args = parser.parse_args()
 
     model, tokenizer, model_args, ctrl_group, global_rank, pp_rank, pp_peer_rank = init_runtime(

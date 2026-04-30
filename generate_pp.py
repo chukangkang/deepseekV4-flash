@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.abspath(encoding_dir))
 from encoding_dsv4 import encode_messages, parse_message_from_completion_text
 
 
-TP_SIZE = 8  # tensor parallelism (within each node)
+TP_SIZE = 8
 
 
 def _remap_key(ckpt_key: str, layer_start: int, layer_end: int, pp_rank: int, pp_size: int):
@@ -142,11 +142,135 @@ _pp_prof_fwd_window = 0.0
 _pp_prof_wait_window = 0.0
 _PP_PROF_INTERVAL = 50
 _PP_PROF_ENABLED = os.environ.get("PP_PROFILE", "0") == "1"
+_PP_PIPELINE = os.environ.get("PP_PIPELINE", "1") == "1"
+_PP_PIPELINE_MIN_BSZ = int(os.environ.get("PP_PIPELINE_MIN_BSZ", "6"))
+
+
+# ---------------------------------------------------------------------------
+# KV cache batch-offset helpers for micro-batch pipeline
+# ---------------------------------------------------------------------------
+
+def _offset_cache_mgr(mgr, offset):
+    """Shift DynamicKVCache or TurboQuantKVCache storage along batch dim."""
+    # DynamicKVCache path
+    if hasattr(mgr, 'flat_storage') and mgr.flat_storage is not None:
+        if offset > 0:
+            if not hasattr(mgr, '_pp_orig_flat'):
+                mgr._pp_orig_flat = mgr.flat_storage
+            mgr.flat_storage = mgr._pp_orig_flat[offset:]
+        elif hasattr(mgr, '_pp_orig_flat'):
+            mgr.flat_storage = mgr._pp_orig_flat
+            del mgr._pp_orig_flat
+    # TurboQuantKVCache path
+    for attr in ('quantized', 'scales', 'zeros', '_bf16_view'):
+        val = getattr(mgr, attr, None)
+        if val is None:
+            continue
+        orig_key = f'_pp_orig_{attr}'
+        if offset > 0:
+            if not hasattr(mgr, orig_key):
+                setattr(mgr, orig_key, val)
+            setattr(mgr, attr, getattr(mgr, orig_key)[offset:])
+        elif hasattr(mgr, orig_key):
+            setattr(mgr, attr, getattr(mgr, orig_key))
+            delattr(mgr, orig_key)
+
+
+def _offset_compressor(comp, offset):
+    """Shift Compressor kv_state / score_state along batch dim."""
+    if offset > 0:
+        if not hasattr(comp, '_pp_orig_kv_state'):
+            comp._pp_orig_kv_state = comp.kv_state
+            comp._pp_orig_score_state = comp.score_state
+        comp.kv_state = comp._pp_orig_kv_state[offset:]
+        comp.score_state = comp._pp_orig_score_state[offset:]
+    elif hasattr(comp, '_pp_orig_kv_state'):
+        comp.kv_state = comp._pp_orig_kv_state
+        comp.score_state = comp._pp_orig_score_state
+        del comp._pp_orig_kv_state, comp._pp_orig_score_state
+
+
+def _set_kv_batch_offset(model, offset):
+    """Shift every layer's KV cache / compressor / indexer views so that
+    batch index 0 in the model maps to physical batch slot `offset`.
+    Call with offset=0 to restore original views."""
+    for layer in model.layers:
+        attn = layer.attn
+        _offset_cache_mgr(attn.kv_cache_mgr, offset)
+        if hasattr(attn, 'compressor') and attn.compressor is not None:
+            _offset_compressor(attn.compressor, offset)
+        if hasattr(attn, 'indexer') and attn.indexer is not None:
+            _offset_cache_mgr(attn.indexer.kv_cache_mgr, offset)
+            if hasattr(attn.indexer, 'compressor'):
+                _offset_compressor(attn.indexer.compressor, offset)
+
+
+def _pp_next_token_pipelined(model, input_ids, start_pos, pp_rank, pp_peer_rank,
+                              hc_mult, dim, vocab_size, temperatures, top_ps, seed):
+    """PP decode with 2 micro-batches: overlap stage0-fwd(B) with stage1-fwd(A).
+
+    Timeline (F=fwd_half, C=comm):
+      Stage0: [fwd_A][isend hA + fwd_B][send hB]...[recv tokA][recv tokB]
+      Stage1: .......[recv hA][fwd_A + irecv hB][send tokA][fwd_B][send tokB]
+                              └─── overlap ────┘
+      Total ≈ 3·F_half + 2·C   vs  current  2·F_full + 2·C
+    """
+    bsz = input_ids.size(0)
+    mid = bsz // 2
+    ids_A, ids_B = input_ids[:mid], input_ids[mid:]
+    temps_A, temps_B = temperatures[:mid], temperatures[mid:]
+    top_ps_A, top_ps_B = top_ps[:mid], top_ps[mid:]
+    if isinstance(start_pos, torch.Tensor):
+        sp_A, sp_B = start_pos[:mid], start_pos[mid:]
+    else:
+        sp_A = sp_B = start_pos
+
+    if pp_rank == 0:
+        # --- micro-batch A (batch slots 0..mid-1) ---
+        h_A = model.forward(ids_A, sp_A)
+        # Async send h_A so we can start fwd_B immediately
+        req_send_A = dist.isend(h_A.contiguous(), dst=pp_peer_rank)
+        # --- micro-batch B (batch slots mid..bsz-1) ---
+        _set_kv_batch_offset(model, mid)
+        h_B = model.forward(ids_B, sp_B)
+        _set_kv_batch_offset(model, 0)
+        # Finish send A, then send B
+        req_send_A.wait()
+        dist.send(h_B.contiguous(), dst=pp_peer_rank)
+        # Receive tokens (two separate recvs to match stage1's two sends)
+        next_token = torch.empty(bsz, dtype=torch.long, device="cuda")
+        dist.recv(next_token[:mid], src=pp_peer_rank)
+        dist.recv(next_token[mid:], src=pp_peer_rank)
+        return next_token
+    else:
+        # --- recv h_A (blocking), start async recv h_B ---
+        h_A = torch.empty(mid, 1, hc_mult, dim, dtype=torch.bfloat16, device="cuda")
+        dist.recv(h_A, src=pp_peer_rank)
+        h_B = torch.empty(bsz - mid, 1, hc_mult, dim, dtype=torch.bfloat16, device="cuda")
+        req_recv_B = dist.irecv(h_B, src=pp_peer_rank)
+        # --- fwd A (overlaps with h_B arriving on NCCL stream) ---
+        logits_A = model.forward(ids_A, sp_A, hidden_states=h_A)
+        tok_A = sample_batch(logits_A, temps_A, top_ps_A, seed)
+        dist.send(tok_A.contiguous(), dst=pp_peer_rank)
+        # --- fwd B ---
+        req_recv_B.wait()
+        _set_kv_batch_offset(model, mid)
+        logits_B = model.forward(ids_B, sp_B, hidden_states=h_B)
+        _set_kv_batch_offset(model, 0)
+        tok_B = sample_batch(logits_B, temps_B, top_ps_B, seed + mid)
+        dist.send(tok_B.contiguous(), dst=pp_peer_rank)
+        return torch.cat([tok_A, tok_B])
+
 
 def pp_next_token(model, input_ids, start_pos, pp_rank, pp_peer_rank, hc_mult, dim, vocab_size,
                   temperatures, top_ps, seed: int, h_buf=None, tok_buf=None):
     global _pp_prof_steps, _pp_prof_fwd_total, _pp_prof_wait_total, _pp_prof_fwd_window, _pp_prof_wait_window
     bsz, seqlen = input_ids.size()
+    # Micro-batch pipeline for decode with enough batch items
+    if _PP_PIPELINE and seqlen == 1 and bsz >= _PP_PIPELINE_MIN_BSZ:
+        return _pp_next_token_pipelined(
+            model, input_ids, start_pos, pp_rank, pp_peer_rank,
+            hc_mult, dim, vocab_size, temperatures, top_ps, seed)
     _do_profile = _PP_PROF_ENABLED and seqlen == 1  # only profile decode steps
     if pp_rank == 0:
         if _do_profile:

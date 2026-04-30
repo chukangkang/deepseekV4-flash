@@ -794,3 +794,204 @@ def fp4_gemm(
     kernel = fp4_gemm_kernel(N, K, scale_dtype=tl_dtype)
     kernel(a.view(M, K), b, c.view(M, N), a_s.view(M, -1), b_s)
     return c
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def grouped_int4_gemm_kernel(N, K, out_dtype=BF16, accum_dtype=FP32, scale_dtype=FP32):
+    """Grouped FP8×INT4 GEMM: each block_M tile uses a different expert's weights.
+
+    A[M, K] — concatenated padded activations (all experts, each padded to block_M=32)
+    B[total_N, K//2] — stacked expert weights, total_N = n_experts * N
+    expert_ids[M_tiles] — maps each M-tile to expert index (0-based local)
+    C[M, N] — output, same N for all experts
+    """
+    M = T.symbolic("M")
+    act_group_size = 128
+    weight_group_size = 32
+    block_M = 32
+    block_N = 128
+    block_K = 32
+    n_sub = act_group_size // block_K
+
+    @T.prim_func
+    def grouped_int4_gemm_kernel_(
+        A: T.Tensor[(M, K), FP8],
+        B: T.Tensor[(T.symbolic("TN"), K // 2), UINT8],
+        C: T.Tensor[(M, N), out_dtype],
+        scales_a: T.Tensor[(M, T.ceildiv(K, act_group_size)), scale_dtype],
+        scales_b: T.Tensor[(T.symbolic("TN2"), T.ceildiv(K, weight_group_size)), FP32],
+        expert_ids: T.Tensor[(T.ceildiv(M, block_M),), INT32],
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), FP8)
+            B_packed_shared = T.alloc_shared((block_N, block_K // 2), UINT8)
+            B_shared = T.alloc_shared((block_N, block_K), FP8)
+            C_shared = T.alloc_shared((block_M, block_N), out_dtype)
+            C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            C_local_accum = T.alloc_fragment((block_M, block_N), accum_dtype)
+            scale_a_frag = T.alloc_fragment((block_M,), FP32)
+            scale_b_frag = T.alloc_fragment((block_N,), FP32)
+            eid_frag = T.alloc_fragment((1,), INT32)
+
+            T.use_swizzle(panel_size=10)
+            T.clear(C_local)
+            T.clear(C_local_accum)
+
+            eid_frag[0] = expert_ids[by]
+
+            K_iters = T.ceildiv(K, block_K)
+            for k in T.Pipelined(K_iters, num_stages=2):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                # Element-wise weight load with runtime expert offset
+                for i, j in T.Parallel(block_N, block_K // 2):
+                    B_packed_shared[i, j] = B[eid_frag[0] * N + bx * block_N + i, k * (block_K // 2) + j]
+
+                for i, j in T.Parallel(block_N, block_K):
+                    byte_idx = j // 2
+                    nibble = j % 2
+                    byte_val = T.Cast(INT32, B_packed_shared[i, byte_idx])
+                    val = T.if_then_else(nibble == 0, byte_val & 0x0F, (byte_val >> 4) & 0x0F)
+                    signed_val = T.if_then_else(val >= 8, val - 16, val)
+                    B_shared[i, j] = T.Cast(FP8, T.Cast(FP32, signed_val))
+
+                for i in T.Parallel(block_N):
+                    scale_b_frag[i] = scales_b[eid_frag[0] * N + bx * block_N + i, k]
+                for i in T.Parallel(block_M):
+                    scale_a_frag[i] = T.Cast(FP32, scales_a[by * block_M + i, k // n_sub])
+
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+
+                for i, j in T.Parallel(block_M, block_N):
+                    C_local_accum[i, j] += C_local[i, j] * scale_a_frag[i] * scale_b_frag[j]
+                T.clear(C_local)
+
+            T.copy(C_local_accum, C_shared)
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return grouped_int4_gemm_kernel_
+
+
+def grouped_int4_gemm(
+    a: torch.Tensor, a_s: torch.Tensor,
+    b_all: torch.Tensor, b_s_all: torch.Tensor,
+    expert_ids: torch.Tensor, N_per_expert: int,
+    scale_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Grouped GEMM: a[M,K] × b_all[n_experts*N, K//2] with expert_ids[M_tiles] selecting weights.
+    Returns c[M, N_per_expert]."""
+    assert a.is_contiguous() and b_all.is_contiguous()
+    tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
+    K = a.size(-1)
+    M = a.numel() // K
+    block_M = 32
+    assert M % block_M == 0, "M must be pre-padded to multiple of block_M=32"
+    c = a.new_empty(M, N_per_expert, dtype=torch.get_default_dtype())
+    kernel = grouped_int4_gemm_kernel(N_per_expert, K, scale_dtype=tl_dtype)
+    kernel(a.view(M, K), b_all, c, a_s.view(M, -1), b_s_all, expert_ids)
+    return c
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def fused_swiglu_quant_kernel(
+    N, quant_block_size=128, in_dtype=BF16, scale_dtype=FP32, swiglu_limit_val=10.0,
+    round_scale=False,
+):
+    """Fused SwiGLU activation + FP8 quantization.
+
+    Computes: h = SiLU(clamp(gate)) * clamp(up) * w  (in FP32)
+    Then block-wise FP8 quantizes h, producing (Y_fp8, S).
+    Inputs gate and up are bf16 (from int4_gemm), w is fp32.
+    """
+    M = T.symbolic("M")
+    fp8_min = -448.0
+    fp8_max = 448.0
+    fp8_max_inv = 1 / fp8_max
+    blk_m = 32
+    group_size = quant_block_size
+
+    @T.prim_func
+    def fused_swiglu_quant_kernel_(
+        Gate: T.Tensor[(M, N), in_dtype],
+        Up: T.Tensor[(M, N), in_dtype],
+        W: T.Tensor[(M, 1), FP32],
+        Y: T.Tensor[(M, N), FP8],
+        S: T.Tensor[(M, T.ceildiv(N, group_size)), scale_dtype],
+    ):
+        with T.Kernel(T.ceildiv(M, blk_m), T.ceildiv(N, group_size), threads=128) as (
+            pid_m,
+            pid_n,
+        ):
+            gate_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            up_shared = T.alloc_shared((blk_m, group_size), in_dtype)
+            h_local = T.alloc_fragment((blk_m, group_size), FP32)
+            amax_local = T.alloc_fragment((blk_m,), FP32)
+            s_local = T.alloc_fragment((blk_m,), FP32)
+            w_local = T.alloc_fragment((blk_m,), FP32)
+            y_local = T.alloc_fragment((blk_m, group_size), FP8)
+            y_shared = T.alloc_shared((blk_m, group_size), FP8)
+
+            T.copy(Gate[pid_m * blk_m, pid_n * group_size], gate_shared)
+            T.copy(Up[pid_m * blk_m, pid_n * group_size], up_shared)
+
+            # Load per-row weights (broadcast across N)
+            for i in T.Parallel(blk_m):
+                w_local[i] = W[pid_m * blk_m + i, 0]
+
+            # Fused SiLU(clamp(gate)) * clamp(up) * w
+            limit = T.Cast(FP32, swiglu_limit_val)
+            for i, j in T.Parallel(blk_m, group_size):
+                g = T.Cast(FP32, gate_shared[i, j])
+                u = T.Cast(FP32, up_shared[i, j])
+                g = T.min(g, limit)
+                u = T.max(T.min(u, limit), -limit)
+                # silu(g) = g * sigmoid(g)
+                sigmoid_g = 1.0 / (1.0 + T.exp(-g))
+                h_local[i, j] = g * sigmoid_g * u * w_local[i]
+
+            # Block-wise FP8 quantization of h
+            T.reduce_absmax(h_local, amax_local, dim=1)
+            for i in T.Parallel(blk_m):
+                amax_local[i] = T.max(amax_local[i], 1e-4)
+                if round_scale:
+                    s_local[i] = fast_round_scale(amax_local[i], fp8_max_inv)
+                else:
+                    s_local[i] = amax_local[i] * fp8_max_inv
+            for i, j in T.Parallel(blk_m, group_size):
+                y_local[i, j] = T.clamp(
+                    h_local[i, j] / s_local[i], fp8_min, fp8_max
+                )
+            for i in T.Parallel(blk_m):
+                S[pid_m * blk_m + i, pid_n] = T.Cast(scale_dtype, s_local[i])
+            T.copy(y_local, y_shared)
+            T.copy(y_shared, Y[pid_m * blk_m, pid_n * group_size])
+
+    return fused_swiglu_quant_kernel_
+
+
+def fused_swiglu_act_quant(
+    gate: torch.Tensor, up: torch.Tensor, w: torch.Tensor,
+    swiglu_limit: float = 10.0, block_size: int = 128,
+    scale_fmt: Optional[str] = None, scale_dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused SiLU(gate) * up * w -> FP8 quantize. Returns (y_fp8, scale)."""
+    N = gate.size(-1)
+    assert N % block_size == 0
+    tl_dtype = FE8M0 if scale_dtype == torch.float8_e8m0fnu else FP32
+    M = gate.numel() // N
+    BLK_M = 32
+    M_al = ((M + BLK_M - 1) // BLK_M) * BLK_M
+    gate_2d = gate.contiguous().view(M, N)
+    up_2d = up.contiguous().view(M, N)
+    w_2d = w.contiguous().view(M, 1) if w.numel() == M else w.view(-1, 1)[:M]
+    if M_al > M:
+        g2 = gate_2d.new_zeros(M_al, N); g2[:M] = gate_2d; gate_2d = g2
+        u2 = up_2d.new_zeros(M_al, N); u2[:M] = up_2d; up_2d = u2
+        w2 = w_2d.new_zeros(M_al, 1); w2[:M] = w_2d; w_2d = w2
+    y_2d = torch.empty(gate_2d.size(0), N, dtype=torch.float8_e4m3fn, device=gate.device)
+    s_2d = gate.new_empty(gate_2d.size(0), N // block_size, dtype=scale_dtype)
+    kernel = fused_swiglu_quant_kernel(N, block_size, scale_dtype=tl_dtype, swiglu_limit_val=swiglu_limit, round_scale=scale_fmt is not None)
+    kernel(gate_2d, up_2d, w_2d, y_2d, s_2d)
+    if M_al > M:
+        y_2d = y_2d[:M]
+        s_2d = s_2d[:M]
+    return y_2d.view_as(gate), s_2d.view(*gate.size()[:-1], N // block_size)

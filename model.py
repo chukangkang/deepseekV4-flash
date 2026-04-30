@@ -10,7 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from kernel import act_quant, fp4_act_quant, int4_act_quant, fp8_gemm, fp4_gemm, int4_gemm, sparse_attn, hc_split_sinkhorn
+from kernel import act_quant, fp4_act_quant, int4_act_quant, fp8_gemm, fp4_gemm, int4_gemm, sparse_attn, hc_split_sinkhorn, fused_swiglu_act_quant, grouped_int4_gemm
 
 
 world_size = 1
@@ -1101,6 +1101,22 @@ class MoE(nn.Module):
                                        for i in range(self.n_routed_experts)])
         assert args.n_shared_experts == 1
         self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
+        self.moe_inter_dim = args.moe_inter_dim
+        self.swiglu_limit = args.swiglu_limit
+        self._grouped_ready = False
+
+    def prepare_grouped_weights(self):
+        """Stack local expert weights into contiguous tensors for grouped GEMM. Call once after model load."""
+        if self._grouped_ready:
+            return
+        experts = [self.experts[self.experts_start_idx + i] for i in range(self.n_local_experts)]
+        self._w1_all = torch.cat([e.w1.weight for e in experts], dim=0).contiguous()
+        self._w1_s_all = torch.cat([e.w1.scale for e in experts], dim=0).contiguous()
+        self._w3_all = torch.cat([e.w3.weight for e in experts], dim=0).contiguous()
+        self._w3_s_all = torch.cat([e.w3.scale for e in experts], dim=0).contiguous()
+        self._w2_all = torch.cat([e.w2.weight for e in experts], dim=0).contiguous()
+        self._w2_s_all = torch.cat([e.w2.scale for e in experts], dim=0).contiguous()
+        self._grouped_ready = True
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
@@ -1139,27 +1155,48 @@ class MoE(nn.Module):
             counts = torch.bincount(sorted_eid, minlength=self.n_routed_experts)
             cumsum = counts.cumsum(0)
             counts_cpu = counts[self.experts_start_idx:self.experts_end_idx].tolist()
-            start = cumsum[self.experts_start_idx - 1].item() if self.experts_start_idx > 0 else 0
+            orig_start = cumsum[self.experts_start_idx - 1].item() if self.experts_start_idx > 0 else 0
             # Pre-quantize activation once for w1/w3 (they share the same input x)
             sorted_x_q, sorted_x_s = act_quant(sorted_x, block_size, scale_fmt, scale_dtype)
+            # --- Grouped GEMM: 4 kernel launches instead of ~96 ---
+            self.prepare_grouped_weights()
+            BLK = 32
+            K_in = sorted_x_q.size(1)    # dim (for w1/w3 input)
+            K_in_s = sorted_x_s.size(1)  # dim // 128
+            # Build padded activation tensor (each expert's chunk aligned to BLK=32)
+            total_tiles = 0
+            for cnt in counts_cpu:
+                if cnt > 0:
+                    total_tiles += (cnt + BLK - 1) // BLK
+            total_padded = total_tiles * BLK
+            a_pad = sorted_x_q.new_zeros(total_padded, K_in)
+            a_s_pad = sorted_x_s.new_zeros(total_padded, K_in_s)
+            w_pad = sorted_w.new_zeros(total_padded, 1)
+            expert_ids = torch.empty(total_tiles, dtype=torch.int32, device=x.device)
+            # Fill padded tensor and expert_ids (cheap CPU loop, no kernel launches)
+            pad_off = 0; tile_off = 0; src = orig_start
+            valid_slices = []  # (pad_offset, count, orig_sorted_start)
             for i, cnt in enumerate(counts_cpu):
                 if cnt == 0:
                     continue
-                eid = self.experts_start_idx + i
-                end = start + cnt
-                e = self.experts[eid]
-                xq, xs = sorted_x_q[start:end], sorted_x_s[start:end]
-                # Direct kernel calls — bypass Expert/Linear Module.__call__
-                gate = int4_gemm(xq, xs, e.w1.weight, e.w1.scale, scale_dtype).float()
-                up = int4_gemm(xq, xs, e.w3.weight, e.w3.scale, scale_dtype).float()
-                if e.swiglu_limit > 0:
-                    up = up.clamp(-e.swiglu_limit, e.swiglu_limit)
-                    gate = gate.clamp(max=e.swiglu_limit)
-                h = F.silu(gate) * up * sorted_w[start:end]
-                h_q, h_s = act_quant(h.to(sorted_x.dtype), block_size, scale_fmt, scale_dtype)
-                out = int4_gemm(h_q, h_s, e.w2.weight, e.w2.scale, scale_dtype)
-                y.index_add_(0, sorted_tid[start:end], out.float())
-                start = end
+                src_end = src + cnt
+                n_t = (cnt + BLK - 1) // BLK
+                padded = n_t * BLK
+                a_pad[pad_off:pad_off+cnt] = sorted_x_q[src:src_end]
+                a_s_pad[pad_off:pad_off+cnt] = sorted_x_s[src:src_end]
+                w_pad[pad_off:pad_off+cnt] = sorted_w[src:src_end]
+                expert_ids[tile_off:tile_off+n_t] = i
+                valid_slices.append((pad_off, cnt, src))
+                pad_off += padded; tile_off += n_t; src = src_end
+            # 3 grouped GEMMs + 1 fused SwiGLU = 4 kernel launches
+            if total_tiles > 0:
+                gate = grouped_int4_gemm(a_pad, a_s_pad, self._w1_all, self._w1_s_all, expert_ids, self.moe_inter_dim, scale_dtype)
+                up   = grouped_int4_gemm(a_pad, a_s_pad, self._w3_all, self._w3_s_all, expert_ids, self.moe_inter_dim, scale_dtype)
+                h_q, h_s = fused_swiglu_act_quant(gate, up, w_pad, self.swiglu_limit, block_size, scale_fmt, scale_dtype)
+                out  = grouped_int4_gemm(h_q, h_s, self._w2_all, self._w2_s_all, expert_ids, self.dim, scale_dtype)
+                # Gather valid (non-padding) rows back into y
+                for (p_off, cnt, o_start) in valid_slices:
+                    y.index_add_(0, sorted_tid[o_start:o_start+cnt], out[p_off:p_off+cnt].float())
         if world_size > 1:
             dist.all_reduce(y, group=tp_group)
         # Wait for shared expert to finish then add
