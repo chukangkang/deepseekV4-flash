@@ -525,9 +525,9 @@ class BatchedOpenAIServer:
             # Decode loop — optimized for the common bsz==1 pure-decode case
             _pure_decode = (bsz == 1 and shared_prefill == max_prompt_len)
             _gen_end_val = generation_ends[0].item() if _pure_decode else 0
-            _step_times = []
+            _decode_start = time.perf_counter()
+            _n_steps = 0
             for cur_pos in range(shared_prefill, total_len):
-                _t0 = time.perf_counter()
                 input_ids = tokens[:, prev_pos:cur_pos]
                 next_token = pp_next_token(
                     self.model,
@@ -544,7 +544,6 @@ class BatchedOpenAIServer:
                     h_buf=_pp_h_buf,
                     tok_buf=_pp_tok_buf,
                 )
-                _step_times.append(time.perf_counter() - _t0)
                 if _pure_decode:
                     # Fast path: bsz=1, all positions are decode — skip prompt_mask checks
                     tokens[0, cur_pos] = next_token[0]
@@ -624,17 +623,14 @@ class BatchedOpenAIServer:
                                             _log(f"V2 early break at pos {cur_pos}: {n_finished_v2}/{bsz} done, "
                                                  f"reprefill={reprefill_cost} vs remaining={remaining_decode}")
                                         break
+                _n_steps += 1
                 prev_pos = cur_pos
-            # Log step timing diagnostics
-            if _step_times and self.global_rank == 0:
-                n = len(_step_times)
-                first = _step_times[0] * 1000
-                if n > 1:
-                    decode_times = _step_times[1:]
-                    avg = sum(decode_times) / len(decode_times) * 1000
-                    _log(f"step timing: first={first:.0f}ms (prefill+decode), decode avg={avg:.1f}ms/tok ({1000/avg:.1f} tok/s), steps={n}")
-                else:
-                    _log(f"step timing: first={first:.0f}ms, steps={n}")
+            # Log step timing diagnostics (wall-clock based)
+            if _n_steps > 0 and self.global_rank == 0:
+                _decode_elapsed = time.perf_counter() - _decode_start
+                avg_ms = _decode_elapsed / _n_steps * 1000
+                _log(f"step timing: avg={avg_ms:.1f}ms/step ({1000/avg_ms:.1f} steps/s), steps={_n_steps}, bsz={bsz}, "
+                     f"effective={bsz * 1000 / avg_ms:.1f} tok/s")
             # Build outputs + continuation info for unfinished items
             early_break = not finished.all()
             outputs: List[Dict[str, Any]] = []
