@@ -446,6 +446,10 @@ def main(
     print(f"[Rank {global_rank}] Loading {shard_file} (PP stage {pp_rank}, layers {model.layer_start}-{model.layer_end-1})")
     loaded, skipped = load_pp_weights(model, shard_file, pp_rank, pp_size)
     print(f"[Rank {global_rank}] Loaded {loaded} tensors, skipped {skipped}")
+    for layer in model.layers:
+        if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'prepare_grouped_weights'):
+            layer.ffn.prepare_grouped_weights()
+    torch.cuda.empty_cache()
 
     torch.set_default_device("cuda")
     print("I'm DeepSeek 👋 (PP=2 x TP=8 mode)")

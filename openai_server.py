@@ -876,6 +876,12 @@ def init_runtime(ckpt_path: str, config_path: str, max_batch_size: int, max_seq_
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
     shard_file = os.path.join(ckpt_path, f"model{tp_rank}-mp{TP_SIZE}.safetensors")
     load_pp_weights(model, shard_file, pp_rank, pp_size)
+    # Eagerly prepare grouped GEMM weights: stack then replace originals with views
+    # to avoid doubling MoE memory during the first inference call.
+    for layer in model.layers:
+        if hasattr(layer, 'ffn') and hasattr(layer.ffn, 'prepare_grouped_weights'):
+            layer.ffn.prepare_grouped_weights()
+    torch.cuda.empty_cache()
     torch.set_default_device("cuda")
     _warmup_pp(pp_rank, pp_peer_rank)
     return model, tokenizer, args, ctrl_group, global_rank, pp_rank, pp_peer_rank

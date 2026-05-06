@@ -1106,16 +1106,30 @@ class MoE(nn.Module):
         self._grouped_ready = False
 
     def prepare_grouped_weights(self):
-        """Stack local expert weights into contiguous tensors for grouped GEMM. Call once after model load."""
+        """Stack local expert weights into contiguous tensors for grouped GEMM. Call once after model load.
+        After stacking, replaces each expert's weight/scale with views into the stacked
+        tensors so the original allocations are freed (no extra memory)."""
         if self._grouped_ready:
             return
         experts = [self.experts[self.experts_start_idx + i] for i in range(self.n_local_experts)]
+        N_w = experts[0].w1.weight.size(0)   # moe_inter_dim (or // 2 for int4)
+        N_s = experts[0].w1.scale.size(0)     # moe_inter_dim
+        N_w2 = experts[0].w2.weight.size(0)
+        N_s2 = experts[0].w2.scale.size(0)
         self._w1_all = torch.cat([e.w1.weight for e in experts], dim=0).contiguous()
         self._w1_s_all = torch.cat([e.w1.scale for e in experts], dim=0).contiguous()
         self._w3_all = torch.cat([e.w3.weight for e in experts], dim=0).contiguous()
         self._w3_s_all = torch.cat([e.w3.scale for e in experts], dim=0).contiguous()
         self._w2_all = torch.cat([e.w2.weight for e in experts], dim=0).contiguous()
         self._w2_s_all = torch.cat([e.w2.scale for e in experts], dim=0).contiguous()
+        # Replace per-expert parameters with views into stacked tensors to free originals
+        for i, e in enumerate(experts):
+            e.w1.weight = nn.Parameter(self._w1_all[i*N_w:(i+1)*N_w], requires_grad=False)
+            e.w1.scale = e.w1.weight.scale = nn.Parameter(self._w1_s_all[i*N_s:(i+1)*N_s], requires_grad=False)
+            e.w3.weight = nn.Parameter(self._w3_all[i*N_w:(i+1)*N_w], requires_grad=False)
+            e.w3.scale = e.w3.weight.scale = nn.Parameter(self._w3_s_all[i*N_s:(i+1)*N_s], requires_grad=False)
+            e.w2.weight = nn.Parameter(self._w2_all[i*N_w2:(i+1)*N_w2], requires_grad=False)
+            e.w2.scale = e.w2.weight.scale = nn.Parameter(self._w2_s_all[i*N_s2:(i+1)*N_s2], requires_grad=False)
         self._grouped_ready = True
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
