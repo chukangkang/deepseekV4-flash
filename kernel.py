@@ -940,13 +940,13 @@ def fused_swiglu_quant_kernel(
             # Fused SiLU(clamp(gate)) * clamp(up) * w
             limit = T.Cast(FP32, swiglu_limit_val)
             for i, j in T.Parallel(blk_m, group_size):
-                g = T.Cast(FP32, gate_shared[i, j])
-                u = T.Cast(FP32, up_shared[i, j])
-                g = T.min(g, limit)
-                u = T.max(T.min(u, limit), -limit)
+                g_raw = T.Cast(FP32, gate_shared[i, j])
+                u_raw = T.Cast(FP32, up_shared[i, j])
+                g_c = T.min(g_raw, limit)
+                u_c = T.max(T.min(u_raw, limit), -limit)
                 # silu(g) = g * sigmoid(g)
-                sigmoid_g = 1.0 / (1.0 + T.exp(-g))
-                h_local[i, j] = g * sigmoid_g * u * w_local[i]
+                sigmoid_g = 1.0 / (1.0 + T.exp(-g_c))
+                h_local[i, j] = g_c * sigmoid_g * u_c * w_local[i]
 
             # Block-wise FP8 quantization of h
             T.reduce_absmax(h_local, amax_local, dim=1)

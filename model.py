@@ -1147,9 +1147,10 @@ class MoE(nn.Module):
             shared_out = self.shared_experts(x)
         # Routed experts on main stream
         n_tokens = x.size(0)
-        if n_tokens <= 2:
-            # Fast path for single/few-token decode: directly iterate activated experts
-            # Avoids bincount (CUDA sync) + 32 torch.where kernel launches per layer
+        if n_tokens <= 64:
+            # Fast path for decode: directly iterate activated experts.
+            # With hc_mult=4, bsz=16 decode gives n_tokens=64.
+            # Grouped GEMM (BLK=32) only helps with large prefill chunks.
             indices_list = indices.tolist()
             for row in range(n_tokens):
                 for col, eid in enumerate(indices_list[row]):
